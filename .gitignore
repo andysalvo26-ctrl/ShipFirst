@@ -1,4 +1,6 @@
-ShipFirstConfig.json
-
 .DS_Store
 ShipFirstConfig.json
+.env.local
+Config/Supabase.local.xcconfig
+
+supabase/functions/.env

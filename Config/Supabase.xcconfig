@@ -1,0 +1,8 @@
+// ShipFirst authoritative Supabase public config.
+// Include this file in iOS target build settings or xcconfig chain.
+// In xcconfig, `//` starts a comment, so keep URL slash pair split.
+SUPABASE_URL = https:/$()/irwiyqwxmsohhrnkawuf.supabase.co
+SUPABASE_ANON_KEY = sb_publishable_3wEdpkCICEsGggVn1bUUFw_N-glz6gS
+// Optional local override (ignored by git). This lets developers swap values locally
+// without touching committed config and without changing runtime loading behavior.
+#include? "Supabase.local.xcconfig"

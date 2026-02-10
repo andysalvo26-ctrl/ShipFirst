@@ -1,10 +1,16 @@
 # Local Setup (v0)
 
-1. Open your Supabase project dashboard, then go to **Project Settings → API**.
-2. Copy the **Project URL** and the **anon/public key** from that API page.
-3. From the repo root, copy the example file:
+Authoritative Supabase values are already committed to:
+- `ShipFirstConfig.example.json`
+- `Config/Supabase.xcconfig`
+- `.env.example`
+
+Use these steps:
+1. Copy the JSON config for local runtime use:
    - `cp ShipFirstConfig.example.json ShipFirstConfig.json`
-4. Open `ShipFirstConfig.json` and paste your real Supabase values.
-5. Never commit `ShipFirstConfig.json`; it is ignored by git and should stay local-only.
-6. The SQL schema has already been applied manually.
-7. No other Supabase setup is required for v0.
+2. Optional local env file for scripts/tools:
+   - `cp .env.example .env.local`
+3. Ensure your iOS target includes `Config/Supabase.xcconfig` in its xcconfig chain (or equivalent build config include).
+4. Never commit `ShipFirstConfig.json` or `.env.local`; both are local-only files.
+5. The SQL schema and RLS are already applied manually.
+6. No other Supabase setup is required for v0.
