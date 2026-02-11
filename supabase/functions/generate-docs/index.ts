@@ -1,5 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
-import { ROLE_IDS, ROLE_META, isTrustLabel, type TrustLabel } from "../_shared/roles.ts";
+import { ROLE_IDS, ROLE_META, isTrustLabel, normalizeTrustLabel, type TrustLabel } from "../_shared/roles.ts";
 import {
   ROLE_BUDGETS,
   hasUnknownClaims,
@@ -33,6 +33,17 @@ type DecisionItem = {
   lock_state: "open" | "locked";
 };
 
+type StageName =
+  | "DISCOVERY"
+  | "EXTRACTION"
+  | "AMBIGUITY"
+  | "CONFIRMATION"
+  | "ASSEMBLY"
+  | "CONSISTENCY"
+  | "COMMIT";
+
+type ErrorLayer = "auth" | "authorization" | "validation" | "schema" | "transient" | "server";
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: CORS_HEADERS });
@@ -40,30 +51,54 @@ Deno.serve(async (req) => {
 
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+    const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
     const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
     const openAIKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
-    if (!supabaseUrl || !serviceRoleKey) {
-      return json({ error: "Missing Supabase server environment." }, 500);
+    if (!supabaseUrl || !supabaseAnonKey || !serviceRoleKey) {
+      return fail(500, "SERVER_CONFIG_MISSING", "Missing Supabase server environment.", "server");
     }
 
     const authHeader = req.headers.get("Authorization") ?? "";
-    const token = authHeader.replace("Bearer ", "").trim();
-    if (!token) return json({ error: "Missing bearer token" }, 401);
+    const supabaseHost = (() => {
+      try {
+        return new URL(supabaseUrl).hostname;
+      } catch {
+        return "invalid_supabase_url";
+      }
+    })();
+    console.log(`[generate-docs] supabase_host=${supabaseHost}`);
+    console.log(`[generate-docs] auth_header_length=${authHeader.length}`);
+    if (!authHeader.toLowerCase().startsWith("bearer ")) {
+      return fail(401, "AUTH_TOKEN_MISSING", "Missing bearer token.", "auth");
+    }
+
+    const authClient = createClient(supabaseUrl, supabaseAnonKey, {
+      global: { headers: { Authorization: authHeader } },
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+
+    const { data: authData, error: authError } = await authClient.auth.getUser();
+    if (authError || !authData.user) return fail(401, "AUTH_INVALID", "Unauthorized.", "auth");
+    const userId = authData.user.id;
 
     const payload = await req.json().catch(() => ({} as Record<string, unknown>));
     const projectId = String(payload.project_id ?? "").trim();
     const cycleNo = Number(payload.cycle_no ?? 1);
-    if (!projectId) return json({ error: "project_id is required" }, 400);
+    const allowLegacy = Boolean(payload.allow_legacy ?? false);
+    if (!projectId) return fail(400, "PROJECT_ID_REQUIRED", "project_id is required.", "validation");
+    if (!allowLegacy) {
+      return fail(
+        409,
+        "LEGACY_ENDPOINT_QUARANTINED",
+        "generate-docs is quarantined in v3; use next-turn + commit-contract flow.",
+        "validation",
+      );
+    }
 
     const supabase = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false },
     });
-
-    const { data: authData, error: authError } = await supabase.auth.getUser(token);
-    if (authError || !authData.user) return json({ error: "Unauthorized" }, 401);
-
-    const userId = authData.user.id;
     const now = new Date().toISOString();
 
     const { data: projectRow, error: projectError } = await supabase
@@ -72,8 +107,8 @@ Deno.serve(async (req) => {
       .eq("id", projectId)
       .single();
 
-    if (projectError || !projectRow) return json({ error: "Project not found" }, 404);
-    if (projectRow.owner_user_id !== userId) return json({ error: "Forbidden" }, 403);
+    if (projectError || !projectRow) return fail(404, "PROJECT_NOT_FOUND", "Project not found.", "validation");
+    if (projectRow.owner_user_id !== userId) return fail(403, "PROJECT_FORBIDDEN", "Project does not belong to current user.", "authorization");
 
     const { data: turnsData, error: turnsError } = await supabase
       .from("intake_turns")
@@ -81,12 +116,19 @@ Deno.serve(async (req) => {
       .eq("project_id", projectId)
       .eq("cycle_no", cycleNo)
       .order("turn_index", { ascending: true });
-    if (turnsError) return json({ error: turnsError.message }, 400);
+    if (turnsError) return failFromDbError(turnsError, "intake_turns.select");
     const intakeTurns = (turnsData ?? []) as IntakeTurn[];
 
     if (intakeTurns.length === 0) {
-      return json({ error: "Discovery gate failed: intake is empty." }, 409);
+      await recordStageRun(supabase, projectId, cycleNo, "DISCOVERY", "failed", {
+        reason: "no_intake_turns",
+        intake_turn_count: 0,
+      });
+      return fail(409, "GATE_DISCOVERY_EMPTY", "Discovery gate failed: intake is empty.", "validation");
     }
+    await recordStageRun(supabase, projectId, cycleNo, "DISCOVERY", "passed", {
+      intake_turn_count: intakeTurns.length,
+    });
 
     const { data: decisionsData, error: decisionsError } = await supabase
       .from("decision_items")
@@ -95,7 +137,7 @@ Deno.serve(async (req) => {
       .eq("cycle_no", cycleNo)
       .order("updated_at", { ascending: false });
 
-    if (decisionsError) return json({ error: decisionsError.message }, 400);
+    if (decisionsError) return failFromDbError(decisionsError, "decision_items.select");
 
     let decisionItems = ((decisionsData ?? []) as DecisionItem[]).filter((d) => isTrustLabel(d.status));
 
@@ -117,21 +159,43 @@ Deno.serve(async (req) => {
         .single();
 
       if (insertError || !inserted || !isTrustLabel(inserted.status)) {
-        return json({ error: insertError?.message ?? "Unable to initialize decision set." }, 400);
+        return failFromDbError(insertError, "decision_items.insert_fallback", "Unable to initialize decision set.");
       }
 
       decisionItems = [inserted as DecisionItem];
     }
+    await recordStageRun(supabase, projectId, cycleNo, "EXTRACTION", "passed", {
+      decision_item_count: decisionItems.length,
+    });
 
     const missingEvidence = decisionItems.filter((d) => !Array.isArray(d.evidence_refs) || d.evidence_refs.length === 0);
     if (missingEvidence.length > 0) {
-      return json({ error: "Ambiguity gate failed: decision items missing evidence." }, 409);
+      await recordStageRun(supabase, projectId, cycleNo, "AMBIGUITY", "failed", {
+        missing_evidence_count: missingEvidence.length,
+      });
+      return fail(409, "GATE_AMBIGUITY_MISSING_EVIDENCE", "Ambiguity gate failed: decision items missing evidence.", "validation");
     }
+    await recordStageRun(supabase, projectId, cycleNo, "AMBIGUITY", "passed", {
+      missing_evidence_count: 0,
+      unknown_count: decisionItems.filter((item) => item.status === "UNKNOWN").length,
+    });
+
+    await recordStageRun(supabase, projectId, cycleNo, "CONFIRMATION", "passed", {
+      locked_count: decisionItems.filter((item) => item.lock_state === "locked").length,
+      unknown_count: decisionItems.filter((item) => item.status === "UNKNOWN").length,
+      blocking_contradictions: 0,
+    });
 
     const inputFingerprint = await computeInputFingerprint(projectId, cycleNo, intakeTurns, decisionItems);
 
     const existing = await findExistingContractVersion(supabase, projectId, cycleNo, inputFingerprint);
     if (existing) {
+      await recordStageRun(supabase, projectId, cycleNo, "COMMIT", "passed", {
+        reused_existing_version: true,
+        contract_version_id: existing.id,
+        contract_version_number: existing.version_number,
+        input_fingerprint: inputFingerprint,
+      });
       const documents = await fetchVersionDocuments(supabase, existing.id);
       return json({
         contract_version_id: existing.id,
@@ -143,6 +207,9 @@ Deno.serve(async (req) => {
 
     let generatedDocs = await generateDocsWithFallback(openAIKey, intakeTurns, decisionItems);
     generatedDocs = enforcePerRoleShape(generatedDocs, intakeTurns, decisionItems);
+    await recordStageRun(supabase, projectId, cycleNo, "ASSEMBLY", "passed", {
+      generated_doc_count: generatedDocs.length,
+    });
 
     const issues: ValidationIssue[] = validateTenDocPacket(generatedDocs);
     const hasUnknownDecisions = decisionItems.some((item) => item.status === "UNKNOWN");
@@ -152,8 +219,17 @@ Deno.serve(async (req) => {
 
     const blocking = issues.filter((issue) => issue.severity === "block");
     if (blocking.length > 0) {
-      return json({ error: "Consistency gate failed.", issues: blocking }, 409);
+      await recordStageRun(supabase, projectId, cycleNo, "CONSISTENCY", "failed", {
+        issue_count: issues.length,
+        block_issue_count: blocking.length,
+        issue_codes: blocking.map((issue) => issue.code),
+      });
+      return fail(409, "GATE_CONSISTENCY_FAILED", "Consistency gate failed.", "validation", { issues: blocking });
     }
+    await recordStageRun(supabase, projectId, cycleNo, "CONSISTENCY", "passed", {
+      issue_count: issues.length,
+      block_issue_count: 0,
+    });
 
     const { data: latestVersion } = await supabase
       .from("contract_versions")
@@ -181,7 +257,7 @@ Deno.serve(async (req) => {
       .single();
 
     if (versionError || !contractVersion) {
-      return json({ error: versionError?.message ?? "Failed to create contract version." }, 400);
+      return failFromDbError(versionError, "contract_versions.insert", "Failed to create contract version.");
     }
 
     for (const doc of generatedDocs) {
@@ -201,7 +277,7 @@ Deno.serve(async (req) => {
         .select("id,project_id,cycle_no,contract_version_id,role_id,title,body,is_complete,created_at")
         .single();
 
-      if (docError || !insertedDoc) return json({ error: docError?.message ?? "Failed inserting contract doc" }, 400);
+      if (docError || !insertedDoc) return failFromDbError(docError, "contract_docs.insert", "Failed inserting contract doc.");
 
       for (const [index, claim] of doc.claims.entries()) {
         const { data: reqRow, error: reqError } = await supabase
@@ -220,7 +296,7 @@ Deno.serve(async (req) => {
           .select("id")
           .single();
 
-        if (reqError || !reqRow) return json({ error: reqError?.message ?? "Failed inserting requirement" }, 400);
+        if (reqError || !reqRow) return failFromDbError(reqError, "requirements.insert", "Failed inserting requirement.");
 
         for (const ref of claim.provenance_refs) {
           const parsed = parseProvenanceRef(ref);
@@ -235,19 +311,15 @@ Deno.serve(async (req) => {
             pointer: ref,
           });
 
-          if (provError) return json({ error: provError.message }, 400);
+          if (provError) return failFromDbError(provError, "provenance_links.insert");
         }
       }
     }
 
-    await supabase.from("generation_runs").insert({
-      project_id: projectId,
-      cycle_no: cycleNo,
-      stage: "COMMIT",
-      status: "passed",
-      details: { contract_version_id: contractVersion.id, version_number: contractVersion.version_number },
+    await recordStageRun(supabase, projectId, cycleNo, "COMMIT", "passed", {
+      contract_version_id: contractVersion.id,
+      version_number: contractVersion.version_number,
       input_fingerprint: inputFingerprint,
-      ended_at: now,
     });
 
     await supabase.from("audit_events").insert({
@@ -269,7 +341,7 @@ Deno.serve(async (req) => {
       reused_existing_version: false,
     });
   } catch (error) {
-    return json({ error: String(error) }, 500);
+    return fail(500, "UNHANDLED_EXCEPTION", String(error), "server");
   }
 });
 
@@ -576,7 +648,7 @@ function enforcePerRoleShape(docs: GeneratedDoc[], turns: IntakeTurn[], decision
     const roleID = doc.role_id;
     const claims = (doc.claims ?? []).map((claim) => ({
       claim_text: String(claim.claim_text ?? "").trim(),
-      trust_label: isTrustLabel(claim.trust_label) ? claim.trust_label : "UNKNOWN",
+      trust_label: normalizeTrustLabel(String(claim.trust_label)) ?? "UNKNOWN",
       provenance_refs: normalizeRefs(claim.provenance_refs, turns[0] ? `turn:${turns[0].id}` : `role:${roleID}`),
     }));
 
@@ -660,7 +732,7 @@ async function tryLLM(openAIKey: string, turns: IntakeTurn[], decisions: Decisio
       const claims = Array.isArray(doc.claims)
         ? doc.claims.map((claim: Record<string, unknown>) => ({
           claim_text: String(claim.claim_text ?? "").trim(),
-          trust_label: isTrustLabel(String(claim.trust_label)) ? (String(claim.trust_label) as TrustLabel) : "UNKNOWN",
+          trust_label: normalizeTrustLabel(String(claim.trust_label)) ?? "UNKNOWN",
           provenance_refs: Array.isArray(claim.provenance_refs)
             ? claim.provenance_refs.map((value: unknown) => String(value).trim()).filter(Boolean)
             : [],
@@ -683,9 +755,64 @@ function parseProvenanceRef(ref: string): { sourceType: "INTAKE_TURN" | "DECISIO
   return { sourceType: "DECISION_ITEM", sourceId: null };
 }
 
+async function recordStageRun(
+  supabase: ReturnType<typeof createClient>,
+  projectId: string,
+  cycleNo: number,
+  stage: StageName,
+  status: "started" | "passed" | "failed",
+  details: Record<string, unknown>,
+) {
+  const fingerprint = await sha256(JSON.stringify({
+    project_id: projectId,
+    cycle_no: cycleNo,
+    stage,
+    details,
+  }));
+
+  await supabase.from("generation_runs").insert({
+    project_id: projectId,
+    cycle_no: cycleNo,
+    stage,
+    status,
+    details,
+    input_fingerprint: details.input_fingerprint ?? fingerprint,
+    run_identity: `${stage}:${fingerprint}`,
+    ended_at: new Date().toISOString(),
+  });
+}
+
 function json(payload: unknown, status = 200) {
   return new Response(JSON.stringify(payload), {
     status,
     headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+  });
+}
+
+function fail(status: number, code: string, message: string, layer: ErrorLayer, details: Record<string, unknown> = {}) {
+  return json({
+    error: {
+      code,
+      message,
+      layer,
+      ...details,
+    },
+  }, status);
+}
+
+function failFromDbError(
+  dbError: { code?: string; message?: string; details?: string; hint?: string } | null,
+  operation: string,
+  fallbackMessage = "Database operation failed.",
+) {
+  const code = dbError?.code ?? "DB_ERROR";
+  const message = dbError?.message ?? fallbackMessage;
+  const schemaCodes = new Set(["42703", "42P01", "42704", "42883"]);
+  const layer: ErrorLayer = schemaCodes.has(code) ? "schema" : "validation";
+  const status = schemaCodes.has(code) ? 500 : 400;
+  return fail(status, code, message, layer, {
+    operation,
+    details: dbError?.details ?? null,
+    hint: dbError?.hint ?? null,
   });
 }

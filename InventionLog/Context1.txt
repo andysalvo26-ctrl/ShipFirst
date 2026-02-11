@@ -1,3 +1,6 @@
+Read below, this is context of conversation between codex and ChatGPT communicating to build ShipFirst
+
+
 You are Codex 5.3. The text that follows this prompt (after this block) is a complete, chronological, canonical transcription of a design conversation about a company called ShipFirst. Read it carefully. 
 
 Do NOT hallucinate new requirements, new goals, or new assumptions. The conversation contains context, corrections, directions, constraints, and evolving definitions. Use the conversation as authoritative source material. If anything in the conversation contradicts itself, label it as “conflict” and summarize the conflicting parts with provenance.

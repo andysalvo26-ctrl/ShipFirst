@@ -250,31 +250,39 @@ export type ManifestDocMeta = {
   title: string;
   claim_count: number;
   created_at: string;
+  content_hash?: string;
 };
 
 export function buildSubmissionManifest(input: {
   run_id: string;
+  project_id: string;
+  cycle_no: number;
   user_id: string;
   contract_version_id: string;
   contract_version_number: number;
   submitted_at: string;
   docs: ManifestDocMeta[];
-  version_tuple: VersionTuple;
+  version_tuple: Record<string, unknown>;
+  packet_hash?: string;
 }): Record<string, unknown> {
   return {
     run_id: input.run_id,
+    project_id: input.project_id,
+    cycle_no: input.cycle_no,
     user_id: input.user_id,
     contract_version_id: input.contract_version_id,
     contract_version_number: input.contract_version_number,
     submitted_at: input.submitted_at,
     document_count: input.docs.length,
     version_tuple: input.version_tuple,
+    packet_hash: input.packet_hash ?? null,
     documents: input.docs.map((doc) => ({
       role_id: doc.role_id,
       role_key: doc.role_key,
       title: doc.title,
       claim_count: doc.claim_count,
       created_at: doc.created_at,
+      content_hash: doc.content_hash ?? null,
     })),
   };
 }

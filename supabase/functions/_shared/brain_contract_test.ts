@@ -87,20 +87,27 @@ Deno.test("buildSubmissionManifest includes contract version and all 10 docs", (
     title: ROLE_META[id].title,
     claim_count: 2,
     created_at: "2026-02-10T00:00:00Z",
+    content_hash: `hash-${id}`,
   }));
 
   const manifest = buildSubmissionManifest({
     run_id: "run-1",
+    project_id: "project-1",
+    cycle_no: 1,
     user_id: "user-1",
     contract_version_id: "version-1",
     contract_version_number: 3,
     submitted_at: "2026-02-10T00:00:00Z",
     docs,
     version_tuple: tuple,
+    packet_hash: "packet-hash",
   });
 
   assertEquals(manifest.run_id, "run-1");
+  assertEquals(manifest.project_id, "project-1");
+  assertEquals(manifest.cycle_no, 1);
   assertEquals(manifest.contract_version_id, "version-1");
   assertEquals(manifest.contract_version_number, 3);
   assertEquals(manifest.document_count, 10);
+  assertEquals(manifest.packet_hash, "packet-hash");
 });

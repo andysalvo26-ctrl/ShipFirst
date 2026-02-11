@@ -6,9 +6,39 @@ enum TrustLabel: String, Codable, CaseIterable {
     case unknown = "UNKNOWN"
 }
 
+enum IntakeActor: String, Codable, CaseIterable {
+    case user = "USER"
+    case system = "SYSTEM"
+}
+
 enum DecisionLockState: String, Codable {
     case open
     case locked
+}
+
+enum DecisionState: String, Codable {
+    case proposed = "PROPOSED"
+    case confirmed = "CONFIRMED"
+}
+
+enum PostureMode: String, Codable, Equatable {
+    case exploration = "Exploration"
+    case artifactGrounding = "Artifact Grounding"
+    case verification = "Verification"
+    case extraction = "Extraction"
+    case alignmentCheckpoint = "Alignment Checkpoint"
+    case recovery = "Recovery"
+}
+
+enum MoveType: String, Codable, Equatable {
+    case openDiscover = "MOVE_OPEN_DISCOVER"
+    case reflectVerify = "MOVE_REFLECT_VERIFY"
+    case targetedClarify = "MOVE_TARGETED_CLARIFY"
+    case alignmentCheckpoint = "MOVE_ALIGNMENT_CHECKPOINT"
+    case scopeReframe = "MOVE_SCOPE_REFRAME"
+    case nuanceProbe = "MOVE_NUANCE_PROBE"
+    case preserveUnknown = "MOVE_PRESERVE_UNKNOWN"
+    case recoveryReset = "MOVE_RECOVERY_RESET"
 }
 
 struct DocumentRole: Identifiable, Hashable {
@@ -63,6 +93,7 @@ struct IntakeTurn: Codable, Identifiable, Equatable {
     let id: UUID
     let projectID: UUID
     let cycleNo: Int
+    let actorType: IntakeActor
     let turnIndex: Int
     let rawText: String
     let createdAt: String
@@ -71,9 +102,39 @@ struct IntakeTurn: Codable, Identifiable, Equatable {
         case id
         case projectID = "project_id"
         case cycleNo = "cycle_no"
+        case actorType = "actor_type"
         case turnIndex = "turn_index"
         case rawText = "raw_text"
         case createdAt = "created_at"
+    }
+
+    init(
+        id: UUID,
+        projectID: UUID,
+        cycleNo: Int,
+        actorType: IntakeActor,
+        turnIndex: Int,
+        rawText: String,
+        createdAt: String
+    ) {
+        self.id = id
+        self.projectID = projectID
+        self.cycleNo = cycleNo
+        self.actorType = actorType
+        self.turnIndex = turnIndex
+        self.rawText = rawText
+        self.createdAt = createdAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        projectID = try container.decode(UUID.self, forKey: .projectID)
+        cycleNo = try container.decode(Int.self, forKey: .cycleNo)
+        turnIndex = try container.decode(Int.self, forKey: .turnIndex)
+        rawText = try container.decode(String.self, forKey: .rawText)
+        createdAt = try container.decode(String.self, forKey: .createdAt)
+        actorType = (try? container.decode(IntakeActor.self, forKey: .actorType)) ?? .user
     }
 }
 
@@ -84,8 +145,12 @@ struct DecisionItem: Codable, Identifiable, Equatable {
     let decisionKey: String
     let claim: String
     let status: TrustLabel
+    let decisionState: DecisionState
     let evidenceRefs: [String]
     let lockState: DecisionLockState
+    let confirmedByTurnID: UUID?
+    let hasConflict: Bool
+    let conflictKey: String?
     let updatedAt: String
 
     enum CodingKeys: String, CodingKey {
@@ -97,7 +162,274 @@ struct DecisionItem: Codable, Identifiable, Equatable {
         case status
         case evidenceRefs = "evidence_refs"
         case lockState = "lock_state"
+        case confirmedByTurnID = "confirmed_by_turn_id"
+        case hasConflict = "has_conflict"
+        case conflictKey = "conflict_key"
         case updatedAt = "updated_at"
+    }
+
+    init(
+        id: UUID,
+        projectID: UUID,
+        cycleNo: Int,
+        decisionKey: String,
+        claim: String,
+        status: TrustLabel,
+        decisionState: DecisionState,
+        evidenceRefs: [String],
+        lockState: DecisionLockState,
+        confirmedByTurnID: UUID? = nil,
+        hasConflict: Bool,
+        conflictKey: String?,
+        updatedAt: String
+    ) {
+        self.id = id
+        self.projectID = projectID
+        self.cycleNo = cycleNo
+        self.decisionKey = decisionKey
+        self.claim = claim
+        self.status = status
+        self.decisionState = decisionState
+        self.evidenceRefs = evidenceRefs
+        self.lockState = lockState
+        self.confirmedByTurnID = confirmedByTurnID
+        self.hasConflict = hasConflict
+        self.conflictKey = conflictKey
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        projectID = try container.decode(UUID.self, forKey: .projectID)
+        cycleNo = try container.decode(Int.self, forKey: .cycleNo)
+        decisionKey = try container.decode(String.self, forKey: .decisionKey)
+        claim = try container.decode(String.self, forKey: .claim)
+        status = try container.decode(TrustLabel.self, forKey: .status)
+        evidenceRefs = (try? container.decode([String].self, forKey: .evidenceRefs)) ?? []
+        lockState = (try? container.decode(DecisionLockState.self, forKey: .lockState)) ?? .open
+        confirmedByTurnID = try? container.decode(UUID.self, forKey: .confirmedByTurnID)
+        decisionState = lockState == .locked ? .confirmed : .proposed
+        hasConflict = (try? container.decode(Bool.self, forKey: .hasConflict)) ?? false
+        conflictKey = try? container.decode(String.self, forKey: .conflictKey)
+        updatedAt = try container.decode(String.self, forKey: .updatedAt)
+    }
+}
+
+struct InterviewOption: Codable, Equatable, Hashable, Identifiable {
+    let id: String
+    let label: String
+}
+
+struct UnresolvedDecision: Codable, Equatable, Identifiable {
+    let id: UUID
+    let decisionKey: String
+    let claim: String
+    let status: TrustLabel
+    let decisionState: DecisionState
+    let hasConflict: Bool
+    let conflictKey: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case decisionKey = "decision_key"
+        case claim
+        case status
+        case decisionState = "decision_state"
+        case hasConflict = "has_conflict"
+        case conflictKey = "conflict_key"
+    }
+}
+
+struct NextTurnResult: Codable, Equatable {
+    struct Checkpoint: Codable, Equatable {
+        let id: UUID
+        let type: String
+        let status: String
+        let prompt: String
+        let options: [InterviewOption]
+        let requiresResponse: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case type
+            case status
+            case prompt
+            case options
+            case requiresResponse = "requires_response"
+        }
+    }
+
+    struct Trace: Codable, Equatable {
+        let correlationID: String
+        let projectID: UUID
+        let cycleNo: Int
+        let userTurnID: UUID
+        let assistantTurnID: UUID
+
+        enum CodingKeys: String, CodingKey {
+            case correlationID = "correlation_id"
+            case projectID = "project_id"
+            case cycleNo = "cycle_no"
+            case userTurnID = "user_turn_id"
+            case assistantTurnID = "assistant_turn_id"
+        }
+    }
+
+    struct ArtifactContextState: Codable, Equatable {
+        let id: UUID?
+        let artifactType: String
+        let artifactRef: String
+        let ingestState: String
+        let verificationState: String
+        let statusMessage: String?
+        let summaryText: String?
+        let provenanceRefs: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case artifactType = "artifact_type"
+            case artifactRef = "artifact_ref"
+            case ingestState = "ingest_state"
+            case verificationState = "verification_state"
+            case statusMessage = "status_message"
+            case summaryText = "summary_text"
+            case provenanceRefs = "provenance_refs"
+        }
+    }
+
+    let projectID: UUID
+    let cycleNo: Int
+    let userTurnID: UUID
+    let assistantTurnID: UUID
+    let assistantMessage: String
+    let options: [InterviewOption]
+    let postureMode: PostureMode
+    let moveType: MoveType
+    let unresolved: [UnresolvedDecision]
+    let canCommit: Bool
+    let commitBlockers: [String]
+    let checkpoint: Checkpoint?
+    let artifact: ArtifactContextState?
+    let provenanceRefs: [String]
+    let trace: Trace
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case cycleNo = "cycle_no"
+        case userTurnID = "user_turn_id"
+        case assistantTurnID = "assistant_turn_id"
+        case assistantMessage = "assistant_message"
+        case options
+        case postureMode = "posture_mode"
+        case moveType = "move_type"
+        case unresolved
+        case canCommit = "can_commit"
+        case commitBlockers = "commit_blockers"
+        case checkpoint
+        case artifact
+        case provenanceRefs = "provenance_refs"
+        case trace
+    }
+}
+
+struct NextTurnCheckpointResponse: Codable, Equatable {
+    let checkpointID: UUID
+    let action: String
+    let optionalText: String?
+
+    enum CodingKeys: String, CodingKey {
+        case checkpointID = "checkpoint_id"
+        case action
+        case optionalText = "optional_text"
+    }
+}
+
+struct NextTurnRequest: Codable, Equatable {
+    let projectID: UUID
+    let cycleNo: Int
+    let userMessage: String?
+    let selectedOptionID: String?
+    let noneFitText: String?
+    let checkpointResponse: NextTurnCheckpointResponse?
+    let artifactRef: String?
+    let artifactType: String?
+    let forceRefresh: Bool?
+
+    init(
+        projectID: UUID,
+        cycleNo: Int,
+        userMessage: String? = nil,
+        selectedOptionID: String? = nil,
+        noneFitText: String? = nil,
+        checkpointResponse: NextTurnCheckpointResponse? = nil,
+        artifactRef: String? = nil,
+        artifactType: String? = nil,
+        forceRefresh: Bool? = nil
+    ) {
+        self.projectID = projectID
+        self.cycleNo = cycleNo
+        self.userMessage = userMessage
+        self.selectedOptionID = selectedOptionID
+        self.noneFitText = noneFitText
+        self.checkpointResponse = checkpointResponse
+        self.artifactRef = artifactRef
+        self.artifactType = artifactType
+        self.forceRefresh = forceRefresh
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case cycleNo = "cycle_no"
+        case userMessage = "user_message"
+        case selectedOptionID = "selected_option_id"
+        case noneFitText = "none_fit_text"
+        case checkpointResponse = "checkpoint_response"
+        case artifactRef = "artifact_ref"
+        case artifactType = "artifact_type"
+        case forceRefresh = "force_refresh"
+    }
+}
+
+struct CommitContractRequest: Codable, Equatable {
+    let projectID: UUID
+    let cycleNo: Int
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case cycleNo = "cycle_no"
+    }
+}
+
+struct CommitContractResult: Codable, Equatable {
+    struct Submission: Codable, Equatable {
+        let submissionID: UUID
+        let bucket: String
+        let path: String
+        let submittedAt: String
+
+        enum CodingKeys: String, CodingKey {
+            case submissionID = "submission_id"
+            case bucket
+            case path
+            case submittedAt = "submitted_at"
+        }
+    }
+
+    let contractVersionID: UUID
+    let contractVersionNumber: Int
+    let documents: [BrainDocument]
+    let submission: Submission?
+    let reviewRequired: Bool
+    let reusedExistingVersion: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case contractVersionID = "contract_version_id"
+        case contractVersionNumber = "contract_version_number"
+        case documents
+        case submission
+        case reviewRequired = "review_required"
+        case reusedExistingVersion = "reused_existing_version"
     }
 }
 
@@ -108,7 +440,6 @@ struct ContractVersionSummary: Codable, Identifiable, Equatable {
     let versionNumber: Int
     let status: String
     let createdAt: String
-    let submissionBundlePath: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -117,7 +448,6 @@ struct ContractVersionSummary: Codable, Identifiable, Equatable {
         case versionNumber = "version_number"
         case status
         case createdAt = "created_at"
-        case submissionBundlePath = "submission_bundle_path"
     }
 }
 
@@ -246,6 +576,60 @@ enum RunValidator {
         }
 
         return DocumentValidationResult(isValid: issues.isEmpty, issues: issues)
+    }
+}
+
+struct CommitReadinessResult: Equatable {
+    let canCommit: Bool
+    let blockers: [String]
+}
+
+enum CommitReadinessEvaluator {
+    private static let requiredDecisionKeys: [String] = [
+        "business_type",
+        "primary_outcome",
+        "launch_capabilities",
+        "monetization_path",
+    ]
+
+    private static func isExplicitlyConfirmed(_ decision: DecisionItem) -> Bool {
+        decision.status == .userSaid &&
+        decision.lockState == .locked &&
+        decision.confirmedByTurnID != nil
+    }
+
+    static func evaluate(decisions: [DecisionItem]) -> CommitReadinessResult {
+        var blockers: [String] = []
+
+        let latestByKey: [String: DecisionItem] = Dictionary(grouping: decisions, by: \.decisionKey)
+            .reduce(into: [:]) { partial, entry in
+                if let latest = entry.value.max(by: { $0.updatedAt < $1.updatedAt }) {
+                    partial[entry.key] = latest
+                }
+            }
+
+        for key in requiredDecisionKeys {
+            guard let decision = latestByKey[key], isExplicitlyConfirmed(decision) else {
+                switch key {
+                case "business_type":
+                    blockers.append("Business type is not confirmed yet.")
+                case "primary_outcome":
+                    blockers.append("First customer outcome is not confirmed yet.")
+                case "launch_capabilities":
+                    blockers.append("Version-one capabilities are not confirmed yet.")
+                case "monetization_path":
+                    blockers.append("Payment approach is not confirmed yet.")
+                default:
+                    blockers.append("A required setup answer is still unconfirmed.")
+                }
+                continue
+            }
+        }
+
+        if decisions.contains(where: \.hasConflict) {
+            blockers.append("At least one contradiction is unresolved.")
+        }
+        return CommitReadinessResult(canCommit: blockers.isEmpty, blockers: blockers)
     }
 }
 

@@ -1,13 +1,15 @@
 # ShipFirst v0 Intake App
 
-This repo contains one customer-facing iOS intake surface and a minimal Supabase server boundary:
-- iOS app: intake -> alignment -> generate exactly 10 docs -> review -> submit
-- Edge functions: `generate-docs`, `submit-run`
-- Submit uploads a zip bundle + manifest to private bucket `shipfirst-submissions`
+This repository implements one customer-facing intake surface and a minimal server boundary:
+- iOS app: intake -> alignment checkpoints -> generate exactly 10 role docs -> review -> submit
+- Edge Functions: `generate-docs`, `submit-run`
+- Submit uploads a zip bundle + manifest to private Storage bucket `shipfirst-submissions`
 
-## 1) Configure secrets (Edge Functions only)
+Canonical run identity is `(project_id, cycle_no)` and not `runs.id`.
 
-1. Open `supabase/functions/.env` and set values:
+## Configure Edge Function secrets
+
+1. Open `supabase/functions/.env` and set:
    - `OPENAI_API_KEY`
    - `SUPABASE_SERVICE_ROLE_KEY`
    - `SHIPFIRST_BRAIN_VERSION`
@@ -17,123 +19,49 @@ This repo contains one customer-facing iOS intake surface and a minimal Supabase
 supabase secrets set --env-file supabase/functions/.env
 ```
 
-## 2) Supabase deploy steps
+These secrets are server-side only and must never be embedded in iOS code.
+
+## Deploy database + functions
 
 ```bash
-# from repo root
-supabase link --project-ref irwiyqwxmsohhrnkawuf
+PROJECT_REF="${PROJECT_REF:-$(grep -E '^SUPABASE_URL' Config/Supabase.xcconfig | head -n1 | cut -d= -f2- | tr -d '[:space:]' | sed 's#:\$()/#://#' | sed -E 's#^https://([^.]+)\.supabase\.co/?$#\1#')}"
+supabase link --project-ref "$PROJECT_REF"
 supabase db push
 supabase functions deploy generate-docs
 supabase functions deploy submit-run
 ```
 
-## 3) iOS build commands
+## Build and test iOS app
 
 ```bash
-# iOS device-style build (code signing disabled)
 xcodebuild \
   -project ShipFirstIntakeApp/ShipFirstIntakeApp.xcodeproj \
   -scheme ShipFirstIntake \
-  -destination 'generic/platform=iOS' \
-  CODE_SIGNING_ALLOWED=NO build
+  -destination 'platform=iOS Simulator,name=iPhone 17,OS=26.2' \
+  build
 
-# simulator build (code signing disabled)
 xcodebuild \
   -project ShipFirstIntakeApp/ShipFirstIntakeApp.xcodeproj \
   -scheme ShipFirstIntake \
-  -destination 'generic/platform=iOS Simulator' \
-  CODE_SIGNING_ALLOWED=NO build
-
-# compile tests without running them
-xcodebuild \
-  -project ShipFirstIntakeApp/ShipFirstIntakeApp.xcodeproj \
-  -scheme ShipFirstIntake \
-  -destination 'generic/platform=iOS Simulator' \
-  CODE_SIGNING_ALLOWED=NO build-for-testing
+  -destination 'platform=iOS Simulator,name=iPhone 17,OS=26.2' \
+  test
 ```
 
-Notes:
-- Running tests (`xcodebuild test`) requires a concrete simulator device.
-- If CoreSimulator is unavailable on your machine, use the `build-for-testing` command above to verify test compilation.
+At runtime the app loads:
+- `SHIPFIRST_SUPABASE_URL` from `Info.plist` (`$(SUPABASE_URL)` build setting)
+- `SHIPFIRST_SUPABASE_ANON_KEY` from `Info.plist` (`$(SUPABASE_ANON_KEY)` build setting)
 
-## 3.1) Brain invariant unit tests (server-side helpers)
+## End-to-end API verification
 
-```bash
-deno test supabase/functions/_shared/brain_contract_test.ts
-```
+Use `VERIFY.md` for exact commands to:
+- sign in
+- create a project
+- append intake turns
+- call `generate-docs` and confirm 10 docs
+- call `submit-run` and confirm `submission_artifacts.storage_path`
 
-## 4) End-to-end API test (generate + submit)
+## Supabase tables used by this build
 
-Set env vars first:
-
-```bash
-export SUPABASE_URL="https://irwiyqwxmsohhrnkawuf.supabase.co"
-export SUPABASE_ANON_KEY="sb_publishable_3wEdpkCICEsGggVn1bUUFw_N-glz6gS"
-export TEST_EMAIL="you@example.com"
-export TEST_PASSWORD="change-me-123456"
-```
-
-Get an access token (create user first if needed):
-
-```bash
-# optional sign-up (ignore if user already exists)
-curl -s "$SUPABASE_URL/auth/v1/signup" \
-  -H "apikey: $SUPABASE_ANON_KEY" \
-  -H "Content-Type: application/json" \
-  -d "{\"email\":\"$TEST_EMAIL\",\"password\":\"$TEST_PASSWORD\"}" >/dev/null
-
-ACCESS_TOKEN=$(curl -s "$SUPABASE_URL/auth/v1/token?grant_type=password" \
-  -H "apikey: $SUPABASE_ANON_KEY" \
-  -H "Content-Type: application/json" \
-  -d "{\"email\":\"$TEST_EMAIL\",\"password\":\"$TEST_PASSWORD\"}" | jq -r '.access_token')
-
-echo "$ACCESS_TOKEN" | head -c 24; echo
-```
-
-Create a run and add one intake turn:
-
-```bash
-RUN_ID=$(curl -s "$SUPABASE_URL/rest/v1/runs?select=id" \
-  -H "apikey: $SUPABASE_ANON_KEY" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -H "Prefer: return=representation" \
-  -d '{"status":"draft","current_stage":"DISCOVERY"}' | jq -r '.[0].id')
-
-curl -s "$SUPABASE_URL/rest/v1/intake_turns?select=id" \
-  -H "apikey: $SUPABASE_ANON_KEY" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -H "Prefer: return=representation" \
-  -d "{\"run_id\":\"$RUN_ID\",\"turn_index\":1,\"actor_type\":\"USER\",\"raw_text\":\"I want a reading-focused learning app with weekly lesson cadence and clear progress checks.\"}" >/dev/null
-```
-
-Generate docs (must return 10 roles):
-
-```bash
-curl -s "$SUPABASE_URL/functions/v1/generate-docs" \
-  -H "apikey: $SUPABASE_ANON_KEY" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"run_id\":\"$RUN_ID\"}" | jq '{contract_version_id, doc_count:(.documents|length)}'
-```
-
-Submit run (creates bundle zip in Storage):
-
-```bash
-curl -s "$SUPABASE_URL/functions/v1/submit-run" \
-  -H "apikey: $SUPABASE_ANON_KEY" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"run_id\":\"$RUN_ID\"}" | jq
-```
-
-Verify submission record and storage path:
-
-```bash
-curl -s "$SUPABASE_URL/rest/v1/submissions?run_id=eq.$RUN_ID&select=id,contract_version_id,path,bucket,created_at" \
-  -H "apikey: $SUPABASE_ANON_KEY" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" | jq
-```
-
-The operator handoff artifact is the uploaded zip at `shipfirst-submissions/<user_id>/<run_id>/...` and can be downloaded from Supabase Dashboard -> Storage.
+- Client writable: `projects`, `intake_turns`, `decision_items`
+- Server writable (functions only): `generation_runs`, `contract_versions`, `contract_docs`, `requirements`, `provenance_links`, `submission_artifacts`, `audit_events`
+- Storage bucket: `shipfirst-submissions` (private)

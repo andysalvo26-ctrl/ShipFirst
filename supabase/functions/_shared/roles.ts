@@ -14,7 +14,14 @@ export const ROLE_META: Record<number, { key: string; title: string }> = {
 };
 
 export type TrustLabel = "USER_SAID" | "ASSUMED" | "UNKNOWN";
+export type TrustLabelInput = TrustLabel | "HYPOTHESIZED";
 
 export function isTrustLabel(value: string): value is TrustLabel {
   return value === "USER_SAID" || value === "ASSUMED" || value === "UNKNOWN";
+}
+
+export function normalizeTrustLabel(value: string): TrustLabel | null {
+  if (value === "HYPOTHESIZED") return "ASSUMED";
+  if (isTrustLabel(value)) return value;
+  return null;
 }
