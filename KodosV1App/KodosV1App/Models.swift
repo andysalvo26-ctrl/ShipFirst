@@ -41,46 +41,6 @@ enum MoveType: String, Codable, Equatable {
     case recoveryReset = "MOVE_RECOVERY_RESET"
 }
 
-enum PlanStage: String, Codable, Equatable {
-    case ideaCapture = "idea_capture"
-    case draftReady = "draft_ready"
-    case draftStrengthening = "draft_strengthening"
-    case builderReady = "builder_ready"
-}
-
-enum GenerationMode: String, Codable, Equatable, CaseIterable, Identifiable {
-    case fastDraft = "fast_draft"
-    case strengthen = "strengthen"
-
-    var id: String { rawValue }
-}
-
-enum DocQualityTier: String, Codable, Equatable {
-    case mvp
-    case solid
-    case strong
-}
-
-struct DocStrength: Codable, Equatable, Identifiable {
-    let roleID: Int
-    let score: Int
-    let qualityTier: DocQualityTier
-    let unresolvedCount: Int
-    let provenanceDensity: Double
-    let reasons: [String]
-
-    var id: Int { roleID }
-
-    enum CodingKeys: String, CodingKey {
-        case roleID = "role_id"
-        case score
-        case qualityTier = "quality_tier"
-        case unresolvedCount = "unresolved_count"
-        case provenanceDensity = "provenance_density"
-        case reasons
-    }
-}
-
 struct DocumentRole: Identifiable, Hashable {
     let id: Int
     let key: String
@@ -115,7 +75,7 @@ struct AuthSession: Codable, Equatable {
     let email: String
 }
 
-struct RunSummary: Equatable, Hashable, Identifiable {
+struct RunSummary: Equatable, Identifiable {
     let projectID: UUID
     let cycleNo: Int
     let title: String
@@ -282,47 +242,6 @@ struct UnresolvedDecision: Codable, Equatable, Identifiable {
 }
 
 struct NextTurnResult: Codable, Equatable {
-    struct ReadinessBucket: Codable, Equatable, Identifiable {
-        let key: String
-        let label: String
-        let status: String
-        let detail: String
-
-        var id: String { key }
-    }
-
-    struct Readiness: Codable, Equatable {
-        let score: Int
-        let resolvedCount: Int
-        let totalCount: Int
-        let nextFocus: String
-        let buckets: [ReadinessBucket]
-
-        enum CodingKeys: String, CodingKey {
-            case score
-            case resolvedCount = "resolved_count"
-            case totalCount = "total_count"
-            case nextFocus = "next_focus"
-            case buckets
-        }
-    }
-
-    struct UnderstandingIndicator: Codable, Equatable {
-        let level: String
-        let title: String
-        let summary: String
-        let nextStep: String
-        let confidence: Double
-
-        enum CodingKeys: String, CodingKey {
-            case level
-            case title
-            case summary
-            case nextStep = "next_step"
-            case confidence
-        }
-    }
-
     struct Checkpoint: Codable, Equatable {
         let id: UUID
         let type: String
@@ -379,45 +298,17 @@ struct NextTurnResult: Codable, Equatable {
         }
     }
 
-    struct QuestionPayload: Codable, Equatable {
-        let slotKey: String
-        let prompt: String
-        let options: [InterviewOption]
-        let whyQuestion: String
-        let retrievalRefs: [String]
-
-        enum CodingKeys: String, CodingKey {
-            case slotKey = "slot_key"
-            case prompt
-            case options
-            case whyQuestion = "why_question"
-            case retrievalRefs = "retrieval_refs"
-        }
-    }
-
     let projectID: UUID
     let cycleNo: Int
     let userTurnID: UUID
     let assistantTurnID: UUID
     let assistantMessage: String
     let options: [InterviewOption]
-    let question: QuestionPayload?
     let postureMode: PostureMode
     let moveType: MoveType
     let unresolved: [UnresolvedDecision]
     let canCommit: Bool
     let commitBlockers: [String]
-    let qualityReady: Bool?
-    let qualityBoostAvailable: Bool?
-    let qualityHint: String?
-    let readiness: Readiness?
-    let planStage: PlanStage?
-    let planID: UUID?
-    let revisionNo: Int?
-    let suggestedGenerationMode: GenerationMode?
-    let understandingIndicator: UnderstandingIndicator?
-    let domainKitKey: String?
-    let docStrengths: [DocStrength]?
     let checkpoint: Checkpoint?
     let artifact: ArtifactContextState?
     let provenanceRefs: [String]
@@ -430,23 +321,11 @@ struct NextTurnResult: Codable, Equatable {
         case assistantTurnID = "assistant_turn_id"
         case assistantMessage = "assistant_message"
         case options
-        case question
         case postureMode = "posture_mode"
         case moveType = "move_type"
         case unresolved
         case canCommit = "can_commit"
         case commitBlockers = "commit_blockers"
-        case qualityReady = "quality_ready"
-        case qualityBoostAvailable = "quality_boost_available"
-        case qualityHint = "quality_hint"
-        case readiness
-        case planStage = "plan_stage"
-        case planID = "plan_id"
-        case revisionNo = "revision_no"
-        case suggestedGenerationMode = "suggested_generation_mode"
-        case understandingIndicator = "understanding_indicator"
-        case domainKitKey = "domain_kit_key"
-        case docStrengths = "doc_strengths"
         case checkpoint
         case artifact
         case provenanceRefs = "provenance_refs"
@@ -510,45 +389,15 @@ struct NextTurnRequest: Codable, Equatable {
         case artifactType = "artifact_type"
         case forceRefresh = "force_refresh"
     }
-
-    var hasActionableInput: Bool {
-        let hasUserMessage = !(userMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-        let hasSelectedOption = !(selectedOptionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-        let hasArtifactRef = !(artifactRef?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-        let hasCheckpointResponse = checkpointResponse != nil
-        return hasUserMessage || hasSelectedOption || hasArtifactRef || hasCheckpointResponse
-    }
-}
-
-enum TypedActionKind: Equatable {
-    case addEvidence(text: String)
-    case selectOption(id: String, noneFitText: String?)
-    case respondCheckpoint(id: UUID, action: String, optionalText: String?)
-    case correctArtifactUnderstanding(id: UUID?, text: String)
-    case deferUnknown(pointer: String, reason: String?)
-    case requestCommit(mode: GenerationMode)
-    case confirmReviewAndSubmit
-}
-
-struct TypedAction: Equatable {
-    let kind: TypedActionKind
-}
-
-enum TypedActionOutcome: Equatable {
-    case turn(NextTurnResult)
-    case commit(CommitContractResult)
-    case submit(SubmissionResult)
 }
 
 struct CommitContractRequest: Codable, Equatable {
     let projectID: UUID
     let cycleNo: Int
-    let generationMode: GenerationMode?
 
     enum CodingKeys: String, CodingKey {
         case projectID = "project_id"
         case cycleNo = "cycle_no"
-        case generationMode = "generation_mode"
     }
 }
 
@@ -573,8 +422,6 @@ struct CommitContractResult: Codable, Equatable {
     let submission: Submission?
     let reviewRequired: Bool
     let reusedExistingVersion: Bool
-    let generationMode: GenerationMode?
-    let qualityTarget: String?
 
     enum CodingKeys: String, CodingKey {
         case contractVersionID = "contract_version_id"
@@ -583,8 +430,6 @@ struct CommitContractResult: Codable, Equatable {
         case submission
         case reviewRequired = "review_required"
         case reusedExistingVersion = "reused_existing_version"
-        case generationMode = "generation_mode"
-        case qualityTarget = "quality_target"
     }
 }
 
@@ -664,9 +509,6 @@ struct SubmissionResult: Codable, Equatable {
     let bucket: String
     let path: String
     let submittedAt: String
-    let planID: UUID?
-    let revisionNo: Int?
-    let planStage: PlanStage?
 
     enum CodingKeys: String, CodingKey {
         case submissionID = "submission_id"
@@ -674,9 +516,6 @@ struct SubmissionResult: Codable, Equatable {
         case bucket
         case path
         case submittedAt = "submitted_at"
-        case planID = "plan_id"
-        case revisionNo = "revision_no"
-        case planStage = "plan_stage"
     }
 }
 

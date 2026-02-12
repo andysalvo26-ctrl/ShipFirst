@@ -261,6 +261,8 @@ Deno.serve(async (req) => {
         path: objectPath,
         manifest_contract_version_id: versionId,
         packet_hash: packetHash,
+        plan_id: projectId,
+        revision_no: cycleNo,
       },
     });
 
@@ -270,6 +272,9 @@ Deno.serve(async (req) => {
       bucket: "shipfirst-submissions",
       path: objectPath,
       submitted_at: now,
+      plan_id: projectId,
+      revision_no: cycleNo,
+      plan_stage: "builder_ready",
     });
   } catch (error) {
     return fail(500, "UNHANDLED_EXCEPTION", String(error), "server");

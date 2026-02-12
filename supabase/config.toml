@@ -140,6 +140,29 @@ enabled = false
 max_buckets = 10
 max_indexes = 5
 
+# ShipFirst functions perform explicit bearer validation with auth.getUser().
+# Disable gateway JWT verification to avoid edge-gateway token mismatch failures.
+[functions.next-turn]
+verify_jwt = false
+
+[functions.commit-contract]
+verify_jwt = false
+
+[functions.submit-run]
+verify_jwt = false
+
+[functions.generate-docs]
+verify_jwt = false
+
+[functions.kodos-v6-projects]
+verify_jwt = false
+
+[functions.kodos-v6-turn]
+verify_jwt = false
+
+[functions.kodos-v6-generate]
+verify_jwt = false
+
 # Vector Buckets is available to Supabase Pro plan.
 # [storage.vector.buckets.documents-openai]
 

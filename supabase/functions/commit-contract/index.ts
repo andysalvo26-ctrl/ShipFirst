@@ -40,6 +40,22 @@ type DecisionItem = {
   conflict_key: string | null;
 };
 
+type GenerationMode = "fast_draft" | "strengthen";
+
+type MemoryMatch = {
+  source_type: string;
+  source_id: string;
+  chunk_text: string;
+  provenance_refs: string[];
+  similarity: number;
+};
+
+type RoleContextPack = {
+  role_id: number;
+  highlights: string[];
+  provenance_refs: string[];
+};
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS_HEADERS });
 
@@ -66,6 +82,8 @@ Deno.serve(async (req) => {
     const payload = await req.json().catch(() => ({} as Record<string, unknown>));
     const projectId = String(payload.project_id ?? "").trim();
     const cycleNoInput = Number(payload.cycle_no ?? 0);
+    const generationMode = normalizeGenerationMode(payload.generation_mode ?? payload.mode);
+    const qualityTarget = generationMode === "strengthen" ? "strong" : "mvp";
     if (!projectId) return fail(400, "PROJECT_ID_REQUIRED", "project_id is required.", "validation");
 
     const supabase = createClient(supabaseUrl, serviceRoleKey, {
@@ -100,6 +118,23 @@ Deno.serve(async (req) => {
     if (decisionsError) return failFromDbError(decisionsError, "decision_items.select");
     const decisions = ((decisionsData ?? []) as DecisionItem[]).filter((d) => isTrustLabel(d.status));
 
+    const { data: latestCommittedVersion } = await supabase
+      .from("contract_versions")
+      .select("id,version_number")
+      .eq("project_id", projectId)
+      .eq("cycle_no", cycleNo)
+      .order("version_number", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (generationMode === "strengthen" && !latestCommittedVersion) {
+      return fail(
+        409,
+        "STRENGTHEN_REQUIRES_DRAFT",
+        "Strengthen mode requires an existing draft plan. Generate a fast draft first.",
+        "validation",
+      );
+    }
+
     const gateIssues = validateCommitGates(intakeTurns, decisions);
     if (gateIssues.length > 0) {
       return fail(409, "COMMIT_VALIDATION_FAILED", "Commit gate failed.", "validation", { issues: gateIssues });
@@ -117,11 +152,34 @@ Deno.serve(async (req) => {
         submission: existingSubmission,
         review_required: existingSubmission ? false : true,
         reused_existing_version: true,
+        generation_mode: generationMode,
+        quality_target: qualityTarget,
       });
     }
 
-    let generatedDocs = await generateDocsWithFallback(openAIKey, intakeTurns, decisions);
-    generatedDocs = enforcePerRoleShape(generatedDocs, intakeTurns, decisions);
+    const roleContextPacks = await buildRoleContextPacks(supabase, {
+      openAIKey,
+      projectId,
+      cycleNo,
+      turns: intakeTurns,
+      decisions,
+    });
+
+    let generatedDocs = await generateDocsWithFallback({
+      openAIKey,
+      turns: intakeTurns,
+      decisions,
+      generationMode,
+      roleContextPacks,
+    });
+    generatedDocs = enforcePerRoleShape(generatedDocs, intakeTurns, decisions, roleContextPacks);
+
+    if (generationMode === "strengthen") {
+      const weakRoleIDs = identifyWeakRoleIDs(generatedDocs);
+      if (weakRoleIDs.length > 0) {
+        generatedDocs = strengthenDocsDeterministic(generatedDocs, weakRoleIDs, roleContextPacks);
+      }
+    }
 
     const packetIssues: ValidationIssue[] = validateTenDocPacket(generatedDocs);
     const unknownDecisions = decisions.some((item) => item.status === "UNKNOWN");
@@ -228,6 +286,8 @@ Deno.serve(async (req) => {
       details: {
         contract_version_id: insertedVersion.id,
         contract_version_number: insertedVersion.version_number,
+        generation_mode: generationMode,
+        quality_target: qualityTarget,
       },
       run_identity: `commit:${insertedVersion.id}`,
       input_fingerprint: inputFingerprint,
@@ -246,6 +306,32 @@ Deno.serve(async (req) => {
       payload: {
         contract_version_number: insertedVersion.version_number,
         review_required: true,
+        generation_mode: generationMode,
+        quality_target: qualityTarget,
+      },
+    });
+
+    await persistV3DocStrengthSnapshots(supabase, {
+      projectId,
+      cycleNo,
+      contractVersionId: String(insertedVersion.id),
+      docs: generatedDocs,
+      decisions,
+      generatedBy: "commit-contract",
+    });
+
+    await persistV3RetrievalRun(supabase, {
+      projectId,
+      cycleNo,
+      purpose: "doc_generation",
+      queryText: `commit-contract:${generationMode}`,
+      topK: 12,
+      results: {
+        generation_mode: generationMode,
+        quality_target: qualityTarget,
+        decision_count: decisions.length,
+        has_unknown_decisions: decisions.some((decision) => decision.status === "UNKNOWN"),
+        role_context_coverage: roleContextPacks.filter((pack) => pack.highlights.length > 0).length,
       },
     });
 
@@ -258,6 +344,8 @@ Deno.serve(async (req) => {
       submission: null,
       review_required: true,
       reused_existing_version: false,
+      generation_mode: generationMode,
+      quality_target: qualityTarget,
     });
   } catch (error) {
     return fail(500, "UNHANDLED_EXCEPTION", String(error), "server");
@@ -272,7 +360,28 @@ function validateCommitGates(intakeTurns: IntakeTurn[], decisions: DecisionItem[
   }
 
   if (!hasExplicitlyConfirmedBusinessType(decisions)) {
-    issues.push({ code: "BUSINESS_TYPE_UNCONFIRMED", message: "Business type must be explicitly confirmed before commit.", decision_key: "business_type" });
+    issues.push({
+      code: "BUSINESS_TYPE_UNCONFIRMED",
+      message: "Business type must be explicitly confirmed before commit.",
+      decision_key: "business_type",
+    });
+  }
+
+  const latestByKey = latestDecisionByKey(decisions);
+  const requiredDecisionKeys = ["primary_outcome", "launch_capabilities", "monetization_path"];
+  for (const key of requiredDecisionKeys) {
+    const decision = latestByKey[key];
+    const confirmed = decision
+      && decision.status === "USER_SAID"
+      && decision.lock_state === "locked"
+      && Boolean(decision.confirmed_by_turn_id);
+    if (!confirmed) {
+      issues.push({
+        code: "CORE_SCOPE_UNCONFIRMED",
+        message: `Core setup detail "${key}" must be confirmed before commit.`,
+        decision_key: key,
+      });
+    }
   }
 
   const conflicts = decisions.filter((d) => d.has_conflict);
@@ -284,16 +393,17 @@ function validateCommitGates(intakeTurns: IntakeTurn[], decisions: DecisionItem[
     });
   }
 
-  const missingEvidence = decisions.filter((d) => !Array.isArray(d.evidence_refs) || d.evidence_refs.length === 0);
-  for (const missing of missingEvidence) {
-    issues.push({
-      code: "EVIDENCE_MISSING",
-      message: `Decision ${missing.decision_key} has no provenance evidence.`,
-      decision_key: missing.decision_key,
-    });
-  }
-
   return issues;
+}
+
+function latestDecisionByKey(decisions: DecisionItem[]): Record<string, DecisionItem> {
+  const map: Record<string, DecisionItem> = {};
+  for (const decision of decisions) {
+    if (!map[decision.decision_key]) {
+      map[decision.decision_key] = decision;
+    }
+  }
+  return map;
 }
 
 async function computeInputFingerprint(
@@ -419,32 +529,50 @@ async function fetchVersionDocuments(
   }));
 }
 
-async function generateDocsWithFallback(
-  openAIKey: string,
-  turns: IntakeTurn[],
-  decisions: DecisionItem[],
-) {
+async function generateDocsWithFallback(input: {
+  openAIKey: string;
+  turns: IntakeTurn[];
+  decisions: DecisionItem[];
+  generationMode: GenerationMode;
+  roleContextPacks: RoleContextPack[];
+}) {
   let candidateDocs: GeneratedDoc[] = [];
 
-  if (openAIKey) {
+  if (input.openAIKey) {
     try {
-      candidateDocs = await tryLLM(openAIKey, turns, decisions);
+      candidateDocs = await tryLLM(
+        input.openAIKey,
+        input.turns,
+        input.decisions,
+        input.generationMode,
+        input.roleContextPacks,
+      );
     } catch {
       candidateDocs = [];
     }
   }
 
   if (candidateDocs.length === 0) {
-    candidateDocs = buildDeterministicDocs(turns, decisions);
+    candidateDocs = buildDeterministicDocs(input.turns, input.decisions, input.roleContextPacks);
   }
 
-  return stabilizeDocs(candidateDocs, turns, decisions);
+  return stabilizeDocs(candidateDocs, input.turns, input.decisions, input.roleContextPacks);
 }
 
-function buildDeterministicDocs(turns: IntakeTurn[], decisions: DecisionItem[]): GeneratedDoc[] {
+function buildDeterministicDocs(
+  turns: IntakeTurn[],
+  decisions: DecisionItem[],
+  roleContextPacks: RoleContextPack[],
+): GeneratedDoc[] {
   return ROLE_IDS.map((roleID) => {
     const claims = buildClaimsForRole(roleID, turns, decisions);
-    const body = buildRoleBody(roleID, turns, claims, summarizeContext(turns, decisions));
+    const body = buildRoleBody(
+      roleID,
+      turns,
+      claims,
+      summarizeContext(turns, decisions),
+      roleContextPacks.find((item) => item.role_id === roleID),
+    );
     return { role_id: roleID, title: roleTitle(roleID), body, claims };
   });
 }
@@ -494,6 +622,7 @@ function buildRoleBody(
   turns: IntakeTurn[],
   claims: GeneratedDoc["claims"],
   contextSummary: string,
+  roleContext?: RoleContextPack,
 ) {
   const roleMeta = ROLE_META[roleID];
   const budget = ROLE_BUDGETS[roleID];
@@ -506,6 +635,14 @@ function buildRoleBody(
   const acceptanceContext = summarizeRecentTurns(turns);
   const compact = budget.hardMax <= 200;
   const contextSnippet = contextSummary.slice(0, compact ? 90 : 170);
+  const roleAnchors = (roleContext?.highlights ?? []).slice(0, 2);
+  const roleAnchorText = roleAnchors.length > 0
+    ? roleAnchors.map((line) => {
+      const trimmed = line.trim();
+      const short = trimmed.length > 72 ? `${trimmed.slice(0, 69)}...` : trimmed;
+      return `- ${short}`;
+    }).join("\n")
+    : "- No additional personalized context was captured for this role yet.";
 
   const base = [
     "Purpose",
@@ -534,6 +671,9 @@ function buildRoleBody(
       : "- A builder can execute this role without reinterpreting trust labels or provenance.",
     "- Open uncertainty remains visible and does not silently disappear.",
     "",
+    "Personalization Anchors",
+    roleAnchorText,
+    "",
     "Unknowns",
     `- [UNKNOWN] ${unknownClaim}`,
     compact ? "- Additional unknowns remain open until explicit confirmation." : "- Additional unknowns can remain open until user confirmation is captured.",
@@ -551,6 +691,7 @@ function enforcePerRoleShape(
   docs: GeneratedDoc[],
   turns: IntakeTurn[],
   decisions: DecisionItem[],
+  roleContextPacks: RoleContextPack[],
 ) {
   const byRole = new Map<number, GeneratedDoc>();
   for (const doc of docs) {
@@ -563,7 +704,13 @@ function enforcePerRoleShape(
       if (!existing.title || !existing.title.trim()) existing.title = roleTitle(roleID);
       if (!existing.claims || existing.claims.length === 0) existing.claims = buildClaimsForRole(roleID, turns, decisions);
       const mergedClaims = normalizeClaims(existing.claims, roleID, turns, decisions);
-      const body = buildRoleBody(roleID, turns, mergedClaims, summarizeContext(turns, decisions));
+      const body = buildRoleBody(
+        roleID,
+        turns,
+        mergedClaims,
+        summarizeContext(turns, decisions),
+        roleContextPacks.find((item) => item.role_id === roleID),
+      );
       return {
         role_id: roleID,
         title: existing.title.trim(),
@@ -575,7 +722,13 @@ function enforcePerRoleShape(
     return {
       role_id: roleID,
       title: roleTitle(roleID),
-      body: buildRoleBody(roleID, turns, claims, summarizeContext(turns, decisions)),
+      body: buildRoleBody(
+        roleID,
+        turns,
+        claims,
+        summarizeContext(turns, decisions),
+        roleContextPacks.find((item) => item.role_id === roleID),
+      ),
       claims,
     };
   });
@@ -585,13 +738,20 @@ function stabilizeDocs(
   docs: GeneratedDoc[],
   turns: IntakeTurn[],
   decisions: DecisionItem[],
+  roleContextPacks: RoleContextPack[],
 ): GeneratedDoc[] {
-  const shaped = enforcePerRoleShape(docs, turns, decisions);
+  const shaped = enforcePerRoleShape(docs, turns, decisions, roleContextPacks);
   const contextSummary = summarizeContext(turns, decisions);
 
   return shaped.map((doc) => {
     const claims = normalizeClaims(doc.claims, doc.role_id, turns, decisions);
-    const body = buildRoleBody(doc.role_id, turns, claims, contextSummary);
+    const body = buildRoleBody(
+      doc.role_id,
+      turns,
+      claims,
+      contextSummary,
+      roleContextPacks.find((item) => item.role_id === doc.role_id),
+    );
     return {
       role_id: doc.role_id,
       title: roleTitle(doc.role_id),
@@ -645,6 +805,168 @@ function summarizeContext(turns: IntakeTurn[], decisions: DecisionItem[]): strin
     .slice(0, 320);
 }
 
+async function buildRoleContextPacks(
+  supabase: ReturnType<typeof createClient>,
+  input: {
+    openAIKey: string;
+    projectId: string;
+    cycleNo: number;
+    turns: IntakeTurn[];
+    decisions: DecisionItem[];
+  },
+): Promise<RoleContextPack[]> {
+  const decisionContext = input.decisions
+    .slice(0, 6)
+    .map((decision) => `${decision.decision_key}:${decision.claim}`)
+    .join(" ");
+
+  const packs: RoleContextPack[] = [];
+  for (const roleID of ROLE_IDS) {
+    const queryText = `${roleTitle(roleID)} ${decisionContext}`.trim();
+    const matches = await findMemoryMatchesForRole(supabase, {
+      openAIKey: input.openAIKey,
+      projectId: input.projectId,
+      cycleNo: input.cycleNo,
+      queryText,
+    });
+    const highlights = matches
+      .map((item) => item.chunk_text.replace(/\s+/g, " ").trim())
+      .filter((item) => item.length >= 20)
+      .slice(0, 3);
+    const provenanceRefs = matches
+      .flatMap((item) => item.provenance_refs ?? [])
+      .filter((ref, idx, arr) => arr.indexOf(ref) === idx)
+      .slice(0, 8);
+    packs.push({
+      role_id: roleID,
+      highlights,
+      provenance_refs: provenanceRefs,
+    });
+  }
+
+  return packs;
+}
+
+async function findMemoryMatchesForRole(
+  supabase: ReturnType<typeof createClient>,
+  input: {
+    openAIKey: string;
+    projectId: string;
+    cycleNo: number;
+    queryText: string;
+  },
+): Promise<MemoryMatch[]> {
+  const queryEmbedding = input.openAIKey
+    ? await generateEmbedding(input.openAIKey, input.queryText.slice(0, 1200))
+    : null;
+
+  if (queryEmbedding && queryEmbedding.length > 0) {
+    const { data, error } = await supabase.rpc("kodos_v5_match_memory_chunks", {
+      p_project_id: input.projectId,
+      p_cycle_no: input.cycleNo,
+      p_query_embedding: queryEmbedding,
+      p_match_count: 8,
+    });
+    if (!error && Array.isArray(data)) {
+      return data.map((row) => ({
+        source_type: String((row as Record<string, unknown>).source_type ?? "intake_turn"),
+        source_id: String((row as Record<string, unknown>).source_id ?? ""),
+        chunk_text: String((row as Record<string, unknown>).chunk_text ?? ""),
+        provenance_refs: Array.isArray((row as Record<string, unknown>).provenance_refs)
+          ? ((row as Record<string, unknown>).provenance_refs as unknown[]).map((item) => String(item))
+          : [],
+        similarity: Number((row as Record<string, unknown>).similarity ?? 0),
+      }));
+    }
+  }
+
+  const { data, error } = await supabase
+    .from("kodos_v3_memory_chunks")
+    .select("source_type,source_id,chunk_text,provenance_refs")
+    .eq("project_id", input.projectId)
+    .eq("cycle_no", input.cycleNo)
+    .order("created_at", { ascending: false })
+    .limit(20);
+  if (error || !Array.isArray(data)) return [];
+
+  const queryTerms = input.queryText
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 4)
+    .slice(0, 14);
+
+  return data
+    .map((row) => {
+      const raw = row as Record<string, unknown>;
+      const chunk = String(raw.chunk_text ?? "");
+      const lower = chunk.toLowerCase();
+      const lexical = queryTerms.reduce((score, term) => score + (lower.includes(term) ? 1 : 0), 0);
+      return {
+        source_type: String(raw.source_type ?? "intake_turn"),
+        source_id: String(raw.source_id ?? ""),
+        chunk_text: chunk,
+        provenance_refs: Array.isArray(raw.provenance_refs) ? (raw.provenance_refs as unknown[]).map((item) => String(item)) : [],
+        similarity: lexical / Math.max(1, queryTerms.length),
+      } as MemoryMatch;
+    })
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, 8);
+}
+
+function identifyWeakRoleIDs(docs: GeneratedDoc[]): number[] {
+  const weak: number[] = [];
+  for (const doc of docs) {
+    const budget = ROLE_BUDGETS[doc.role_id];
+    const bodyWords = wordCount(doc.body);
+    const claimCount = Math.max(1, doc.claims.length);
+    const coverage = doc.claims.filter((claim) => (claim.provenance_refs ?? []).length > 0).length / claimCount;
+    const unknownCount = doc.claims.filter((claim) => claim.trust_label === "UNKNOWN").length;
+    const tooShort = bodyWords < budget.hardMin;
+    const weakCoverage = coverage < 0.6;
+    const manyUnknowns = unknownCount >= 2;
+    if (tooShort || weakCoverage || manyUnknowns) {
+      weak.push(doc.role_id);
+    }
+  }
+  return weak;
+}
+
+function strengthenDocsDeterministic(
+  docs: GeneratedDoc[],
+  weakRoleIDs: number[],
+  roleContextPacks: RoleContextPack[],
+): GeneratedDoc[] {
+  const weakSet = new Set(weakRoleIDs);
+  return docs.map((doc) => {
+    if (!weakSet.has(doc.role_id)) return doc;
+
+    const contextPack = roleContextPacks.find((item) => item.role_id === doc.role_id);
+    const contextLine = contextPack?.highlights[0]
+      ? `Strengthen pass context: ${contextPack.highlights[0]}`
+      : "Strengthen pass context: keep scope tight and preserve explicit user intent.";
+
+    const strengthenedBody = enforceRoleWordBudget(
+      doc.role_id,
+      `${doc.body}\n\n${contextLine}\nThis role should prioritize MVP buildability over optional complexity.`,
+    );
+
+    const strengthenedClaims = [...doc.claims];
+    if (strengthenedClaims.length < 2) {
+      strengthenedClaims.push({
+        claim_text: "Additional implementation detail requires one more user answer if ambiguity remains.",
+        trust_label: "ASSUMED",
+        provenance_refs: contextPack?.provenance_refs?.slice(0, 1) ?? [`role:${doc.role_id}`],
+      });
+    }
+
+    return {
+      ...doc,
+      body: strengthenedBody,
+      claims: strengthenedClaims.slice(0, 4),
+    };
+  });
+}
+
 function enforceRoleWordBudget(roleID: number, text: string): string {
   const budget = ROLE_BUDGETS[roleID];
   let body = text.trim();
@@ -668,14 +990,18 @@ async function tryLLM(
   openAIKey: string,
   turns: IntakeTurn[],
   decisions: DecisionItem[],
+  generationMode: GenerationMode,
+  roleContextPacks: RoleContextPack[],
 ): Promise<GeneratedDoc[]> {
   const prompt = [
-    "Return exactly 10 JSON docs for role_id 1..10.",
+    "Return exactly 10 JSON docs for role_id 1..10 that can drive an MVP build.",
     "Each doc must include title, body, claims[].",
     "Each claim requires trust_label USER_SAID|ASSUMED|UNKNOWN and provenance_refs[].",
     "Preserve unknown meaning as UNKNOWN.",
+    `Generation mode: ${generationMode}.`,
     `Intake turns: ${JSON.stringify(turns.map((t) => ({ turn_index: t.turn_index, raw_text: t.raw_text })))}`,
     `Decisions: ${JSON.stringify(decisions.map((d) => ({ key: d.decision_key, claim: d.claim, status: d.status, decision_state: d.decision_state, evidence_refs: d.evidence_refs })))}`,
+    `Role contexts: ${JSON.stringify(roleContextPacks)}`,
   ].join("\n");
 
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -716,6 +1042,29 @@ async function tryLLM(
   return docs;
 }
 
+async function generateEmbedding(openAIKey: string, text: string): Promise<number[] | null> {
+  try {
+    const response = await fetch("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${openAIKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "text-embedding-3-small",
+        input: text.slice(0, 4000),
+      }),
+    });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    const embedding = payload?.data?.[0]?.embedding;
+    if (!Array.isArray(embedding)) return null;
+    return embedding.map((value: unknown) => Number(value)).filter((value: number) => Number.isFinite(value));
+  } catch {
+    return null;
+  }
+}
+
 function parseProvenanceRef(ref: string): { sourceType: "INTAKE_TURN" | "DECISION_ITEM"; sourceId: string | null } {
   const normalized = String(ref ?? "").trim();
   if (normalized.startsWith("turn:")) {
@@ -725,6 +1074,94 @@ function parseProvenanceRef(ref: string): { sourceType: "INTAKE_TURN" | "DECISIO
     return { sourceType: "DECISION_ITEM", sourceId: normalized.slice("decision:".length) || null };
   }
   return { sourceType: "DECISION_ITEM", sourceId: null };
+}
+
+function normalizeGenerationMode(input: unknown): GenerationMode {
+  const raw = String(input ?? "fast_draft").trim().toLowerCase();
+  if (raw === "strengthen" || raw === "strengthen_draft" || raw === "improve") return "strengthen";
+  return "fast_draft";
+}
+
+async function persistV3DocStrengthSnapshots(
+  supabase: ReturnType<typeof createClient>,
+  input: {
+    projectId: string;
+    cycleNo: number;
+    contractVersionId: string;
+    docs: GeneratedDoc[];
+    decisions: DecisionItem[];
+    generatedBy: "commit-contract";
+  },
+) {
+  const unresolvedCount = input.decisions.filter((decision) => decision.status === "UNKNOWN" || decision.has_conflict).length;
+  const totalDecisions = Math.max(1, input.decisions.length);
+  const provenanceDensityBase = Math.max(
+    0,
+    Math.min(1, input.decisions.filter((decision) => (decision.evidence_refs ?? []).length > 0).length / totalDecisions),
+  );
+
+  const rows = input.docs.map((doc) => {
+    const wordScore = Math.min(1, wordCount(doc.body) / Math.max(1, ROLE_BUDGETS[doc.role_id].softTarget));
+    const claimCount = Math.max(1, doc.claims.length);
+    const provenanceCoverage = doc.claims.filter((claim) => (claim.provenance_refs ?? []).length > 0).length / claimCount;
+    const unknownPenalty = doc.claims.filter((claim) => claim.trust_label === "UNKNOWN").length * 3;
+    const baseScore = Math.round((wordScore * 40) + (provenanceCoverage * 35) + (provenanceDensityBase * 25)) - unknownPenalty;
+    const strengthScore = Math.max(20, Math.min(95, baseScore));
+    const qualityTier: "mvp" | "solid" | "strong" = strengthScore < 55 ? "mvp" : (strengthScore < 78 ? "solid" : "strong");
+    const notes = [
+      `Claims: ${doc.claims.length}`,
+      `Provenance coverage: ${(provenanceCoverage * 100).toFixed(0)}%`,
+      `Unknown claims: ${doc.claims.filter((claim) => claim.trust_label === "UNKNOWN").length}`,
+    ];
+    return {
+      project_id: input.projectId,
+      cycle_no: input.cycleNo,
+      contract_version_id: input.contractVersionId,
+      role_id: doc.role_id,
+      strength_score: strengthScore,
+      quality_tier: qualityTier,
+      unresolved_count: unresolvedCount,
+      provenance_density: Number(((provenanceCoverage + provenanceDensityBase) / 2).toFixed(3)),
+      notes,
+      generated_by: input.generatedBy,
+    };
+  });
+
+  const { error } = await supabase.from("kodos_v3_doc_strength_snapshots").insert(rows);
+  if (error && !isMissingV3ObjectError(error)) {
+    console.log(`[commit-contract] kodos_v3_doc_strength_snapshots_insert_error=${String(error.code ?? "")}:${String(error.message ?? "unknown")}`);
+  }
+}
+
+async function persistV3RetrievalRun(
+  supabase: ReturnType<typeof createClient>,
+  input: {
+    projectId: string;
+    cycleNo: number;
+    purpose: "question_planning" | "doc_generation" | "doc_strength";
+    queryText: string;
+    topK: number;
+    results: Record<string, unknown>;
+  },
+) {
+  const started = Date.now();
+  const { error } = await supabase.from("kodos_v3_retrieval_runs").insert({
+    project_id: input.projectId,
+    cycle_no: input.cycleNo,
+    purpose: input.purpose,
+    query_text: input.queryText,
+    top_k: input.topK,
+    results: input.results,
+    latency_ms: Date.now() - started,
+  });
+  if (error && !isMissingV3ObjectError(error)) {
+    console.log(`[commit-contract] kodos_v3_retrieval_runs_insert_error=${String(error.code ?? "")}:${String(error.message ?? "unknown")}`);
+  }
+}
+
+function isMissingV3ObjectError(error: { code?: string; message?: string } | null): boolean {
+  const code = String(error?.code ?? "");
+  return code === "42P01" || code === "42703" || code === "42704";
 }
 
 function json(payload: unknown, status = 200) {

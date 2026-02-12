@@ -1,0 +1,55 @@
+ShipFirst: One-Document Definition 
+ShipFirst is a platform that turns a rough app idea into a clear plan, then delivers a working app and owner controls.
+It is built on one principle: customers should not need to know how software is built to get software that feels like theirs.
+1. Product Promise
+	1	You describe your app in plain language.
+	2	ShipFirst asks a short set of smart follow-up questions.
+	3	ShipFirst produces 3 simple planning documents that feel personal, clear, and buildable.
+	4	ShipFirst builders deliver the app and owner console.
+	5	You run your app through ShipFirst infrastructure and control business details in your console.
+2. What ShipFirst Is
+	1	AWS-like in platform reliability and control-plane discipline.
+	2	Shopify-like in owner control and business operation model.
+	3	Loveable-like in understanding intent from minimal input.
+	4	ShipFirst-like in execution: idea to plan to delivered app, without exposing implementation burden to the customer.
+3. What Customers Receive From Intake
+	1	App Vision Brief: what the app is, who it serves, what makes it special.
+	2	MVP Blueprint: the core journey, launch scope, and trust expectations.
+	3	Owner Control Brief: what ShipFirst will build vs what the owner will customize later.
+These 3 docs are readable by non-technical users and actionable for internal builders.
+4. Intelligence Model
+	1	Intake runs as a guided conversation: one question at a time, mostly multiple choice, with optional free text.
+	2	The system stores conversation meaning as structured facts plus embeddings.
+	3	Retrieval is used to keep context, resolve ambiguity, and ask the highest-impact next question.
+	4	Readiness is binary: Not ready or Ready.
+	5	If intent is clear but some detail is missing, ShipFirst generates with explicit assumptions instead of blocking.
+5. Platform Surfaces
+	1	Intake Surface: captures intent and produces the 3-doc plan.
+	2	Builder Surface (internal): turns plan into deliverable app.
+	3	Owner Console: controls dynamic business settings after delivery.
+	4	Runtime Apps: end-user experiences powered by ShipFirst.
+	5	Platform Ops Surface: governance, observability, reliability, compliance.
+6. Database Vision (One Spine for All Surfaces)
+	1	One multi-tenant data backbone for intake, planning, build, runtime, and console.
+	2	Canonical identity and ownership model across every entity.
+	3	Event history plus current-state tables for auditability and speed.
+	4	Versioned artifacts for every plan and change.
+	5	Embedding memory layer tied to source records with provenance and freshness state.
+	6	Strict tenant isolation, policy-based access, and service boundaries.
+7. Enterprise Requirements
+	1	Every important decision is traceable.
+	2	Every generated statement can be labeled as confirmed, assumed, or open.
+	3	Every surface is observable with correlation IDs and lifecycle events.
+	4	Every schema and policy change is governed, testable, and reversible.
+	5	Reliability and security are defaults, not add-ons.
+8. Buildability Rule ShipFirst does not promise infinite complexity in v1. It promises high-confidence, fast-delivery apps with clear scope and strong personalization.
+The intake system must always balance:
+	1	Personal expression.
+	2	MVP simplicity.
+	3	Delivery speed.
+	4	Platform safety.
+9. Success Standard ShipFirst succeeds when a customer says:
+	1	“This is my app idea, captured correctly.”
+	2	“The plan is clear and exciting.”
+	3	“I trust ShipFirst to build and run the hard parts.”
+This is the invention: a scalable app-creation platform where intelligence makes planning feel effortless, and infrastructure makes ownership real.

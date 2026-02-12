@@ -76,6 +76,36 @@ type NextQuestionPlan = {
   assistant_message: string;
   suggestions: Suggestion[];
   why_question: string;
+  slot_key: string;
+  anchor_refs: string[];
+};
+
+type NextQuestionPayload = {
+  slot_key: string;
+  prompt: string;
+  options: Suggestion[];
+  why_question: string;
+  retrieval_refs: string[];
+};
+
+type MemoryMatch = {
+  source_type: string;
+  source_id: string;
+  chunk_text: string;
+  trust_label: TrustLabel;
+  provenance_refs: string[];
+  metadata: Record<string, unknown>;
+  similarity: number;
+};
+
+type UnderstandingLevel = "needs_basics" | "good_draft_ready" | "strong_builder_ready";
+
+type UnderstandingIndicator = {
+  level: UnderstandingLevel;
+  title: string;
+  summary: string;
+  next_step: string;
+  confidence: number;
 };
 
 type ReadinessBucket = {
@@ -91,6 +121,17 @@ type ReadinessState = {
   total_count: number;
   next_focus: string;
   buckets: ReadinessBucket[];
+};
+
+type PlanStage = "idea_capture" | "draft_ready" | "draft_strengthening" | "builder_ready";
+
+type DocStrength = {
+  role_id: number;
+  score: number;
+  quality_tier: "mvp" | "solid" | "strong";
+  unresolved_count: number;
+  provenance_density: number;
+  reasons: string[];
 };
 
 type SignalState = {
@@ -341,6 +382,32 @@ Deno.serve(async (req) => {
     if (latestDecisionError) return failFromDbError(latestDecisionError, "decision_items.select_latest");
 
     const latestDecisions = ((latestDecisionRows ?? []) as DecisionItem[]).filter((row) => isTrustLabel(String(row.status)));
+    const latestContractVersion = await fetchLatestContractVersion(serviceClient, projectId, cycleNo);
+    const hasDraftPlan = Boolean(latestContractVersion);
+    const domainKitKey = inferDomainKitKey({
+      latestUserText: resolvedText || noneFitText,
+      recentTurns,
+      decisions: latestDecisions,
+      artifactRef: artifactContext.row?.artifact_ref ?? null,
+    });
+
+    await syncV3SlotsFromDecisions(serviceClient, {
+      projectId,
+      cycleNo,
+      userTurnId: userTurnInsert.row.id,
+      decisions: latestDecisions,
+      domainKitKey,
+    });
+
+    await persistV3MemoryFromTurn(serviceClient, {
+      openAIKey,
+      projectId,
+      cycleNo,
+      turnId: userTurnInsert.row.id,
+      sourceText: resolvedText || selectedOptionId || noneFitText,
+      selectedOptionId,
+      domainKitKey,
+    });
 
     let questionPlan: NextQuestionPlan;
     let controlState: ControlState;
@@ -359,6 +426,8 @@ Deno.serve(async (req) => {
         assistant_message: "I still need a quick verification response before we narrow decisions.",
         suggestions: [],
         why_question: "artifact_checkpoint_required",
+        slot_key: "artifact_verification",
+        anchor_refs: artifactContext.provenanceRefs ?? [],
       };
       controlState = {
         postureMode: "Artifact Grounding",
@@ -369,6 +438,10 @@ Deno.serve(async (req) => {
       };
     } else {
       questionPlan = await buildNextQuestionPlan({
+        serviceClient,
+        openAIKey,
+        projectId,
+        cycleNo,
         recentTurns,
         decisions: latestDecisions,
         latestUserText: resolvedText || selectedOptionId || "",
@@ -382,6 +455,7 @@ Deno.serve(async (req) => {
       controlState.transitionReason = questionPlan.why_question;
     }
     questionPlan = sanitizeQuestionPlan(questionPlan);
+    questionPlan = enforceQuestionPlanInvariants(questionPlan);
 
     const assistantTurnInsert = await insertTurn(serviceClient, {
       projectId,
@@ -466,6 +540,8 @@ Deno.serve(async (req) => {
           ]
           : [{ id: "readiness:ready_to_commit", label: "Generate my draft plan" }],
         why_question: "core_and_quality_ready",
+        slot_key: "commit_decision",
+        anchor_refs: [],
       };
       controlState = {
         postureMode: "Alignment Checkpoint",
@@ -493,6 +569,52 @@ Deno.serve(async (req) => {
       readiness,
     });
 
+    const docStrengths = buildDocStrengths({
+      decisions: latestDecisions,
+      unresolvedCount: unresolved.length,
+      qualityReady,
+      signalState,
+      artifactContext,
+      hasDraftPlan,
+    });
+    const planStage = derivePlanStage({
+      hasDraftPlan,
+      canCommit,
+      unresolvedCount: unresolved.length,
+      qualityBoostAvailable,
+    });
+    const suggestedGenerationMode = canCommit ? (hasDraftPlan ? "strengthen" : "fast_draft") : null;
+    const understandingIndicator = buildUnderstandingIndicator({
+      readiness,
+      planStage,
+      docStrengths,
+      canCommit,
+      qualityBoostAvailable,
+    });
+
+    await persistV3DocStrengthSnapshots(serviceClient, {
+      projectId,
+      cycleNo,
+      contractVersionId: latestContractVersion?.id ?? null,
+      docStrengths,
+      generatedBy: "next-turn",
+    });
+
+    await persistV3RetrievalRun(serviceClient, {
+      projectId,
+      cycleNo,
+      purpose: "question_planning",
+      queryText: questionPlan.assistant_message,
+      topK: 8,
+      results: {
+        why_question: questionPlan.why_question,
+        unresolved_count: unresolved.length,
+        domain_kit_key: domainKitKey,
+        selected_option_id: selectedOptionId || null,
+        commit_blockers: commitBlockers,
+      },
+    });
+
     await serviceClient.from("audit_events").insert({
       project_id: projectId,
       cycle_no: cycleNo,
@@ -513,8 +635,34 @@ Deno.serve(async (req) => {
         idempotency_key: artifactContext.idempotencyKey,
         checkpoint_id: activeCheckpoint?.id ?? null,
         checkpoint_status: activeCheckpoint?.status ?? null,
+        plan_stage: planStage,
+        suggested_generation_mode: suggestedGenerationMode,
+        question_slot_key: questionPlan.slot_key,
+        understanding_indicator: understandingIndicator,
+        doc_strengths: docStrengths,
+        domain_kit_key: domainKitKey,
       },
     });
+
+    await persistV5QuestionTrace(serviceClient, {
+      projectId,
+      cycleNo,
+      turnId: assistantTurnInsert.row.id,
+      slotKey: questionPlan.slot_key,
+      questionText: questionPlan.assistant_message,
+      options: questionPlan.suggestions,
+      whyQuestion: questionPlan.why_question,
+      understanding: understandingIndicator,
+      retrievalRefs: questionPlan.anchor_refs,
+    });
+
+    const questionPayload: NextQuestionPayload = {
+      slot_key: questionPlan.slot_key,
+      prompt: questionPlan.assistant_message,
+      options: questionPlan.suggestions,
+      why_question: questionPlan.why_question,
+      retrieval_refs: questionPlan.anchor_refs,
+    };
 
     return json({
       project_id: projectId,
@@ -523,6 +671,7 @@ Deno.serve(async (req) => {
       assistant_turn_id: assistantTurnInsert.row.id,
       assistant_message: questionPlan.assistant_message,
       options: questionPlan.suggestions,
+      question: questionPayload,
       posture_mode: controlState.postureMode,
       move_type: controlState.moveType,
       unresolved,
@@ -532,6 +681,13 @@ Deno.serve(async (req) => {
       quality_boost_available: qualityBoostAvailable,
       quality_hint: qualityHint,
       readiness,
+      plan_stage: planStage,
+      plan_id: projectId,
+      revision_no: cycleNo,
+      suggested_generation_mode: suggestedGenerationMode,
+      understanding_indicator: understandingIndicator,
+      domain_kit_key: domainKitKey,
+      doc_strengths: docStrengths,
       why_question: questionPlan.why_question,
       checkpoint: activeCheckpoint
         ? {
@@ -568,6 +724,406 @@ Deno.serve(async (req) => {
     return fail(500, "UNHANDLED_EXCEPTION", String(error), "server");
   }
 });
+
+async function fetchLatestContractVersion(
+  serviceClient: ReturnType<typeof createClient>,
+  projectId: string,
+  cycleNo: number,
+): Promise<{ id: string; version_number: number } | null> {
+  const { data, error } = await serviceClient
+    .from("contract_versions")
+    .select("id,version_number")
+    .eq("project_id", projectId)
+    .eq("cycle_no", cycleNo)
+    .order("version_number", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error || !data) return null;
+  return {
+    id: String((data as Record<string, unknown>).id),
+    version_number: Number((data as Record<string, unknown>).version_number ?? 0),
+  };
+}
+
+function inferDomainKitKey(input: {
+  latestUserText: string;
+  recentTurns: IntakeTurn[];
+  decisions: DecisionItem[];
+  artifactRef: string | null;
+}): string {
+  const joined = [
+    input.latestUserText,
+    input.artifactRef ?? "",
+    input.recentTurns.map((turn) => turn.raw_text).join(" "),
+    input.decisions.map((decision) => `${decision.decision_key}:${decision.claim}`).join(" "),
+  ].join(" ").toLowerCase();
+
+  if (joined.includes("book") || joined.includes("books") || joined.includes("author") || joined.includes("catalog")) {
+    return "commerce_books";
+  }
+  if (
+    joined.includes("booking") || joined.includes("appointment") || joined.includes("schedule") ||
+    joined.includes("service business") || joined.includes("service")
+  ) {
+    return "service_booking";
+  }
+  return "generic_app";
+}
+
+async function syncV3SlotsFromDecisions(
+  serviceClient: ReturnType<typeof createClient>,
+  input: {
+    projectId: string;
+    cycleNo: number;
+    userTurnId: string;
+    decisions: DecisionItem[];
+    domainKitKey: string;
+  },
+) {
+  const trackedKeys = new Set([
+    "business_type",
+    "primary_outcome",
+    "launch_capabilities",
+    "monetization_path",
+    "primary_audience",
+    "quality_signal",
+    "refinement_focus",
+    "latest_user_intent",
+  ]);
+
+  const latestByKey: Record<string, DecisionItem> = {};
+  for (const decision of input.decisions) {
+    if (!trackedKeys.has(decision.decision_key)) continue;
+    if (!latestByKey[decision.decision_key]) {
+      latestByKey[decision.decision_key] = decision;
+    }
+  }
+
+  const rows = Object.values(latestByKey).map((decision) => ({
+    project_id: input.projectId,
+    cycle_no: input.cycleNo,
+    slot_key: decision.decision_key,
+    slot_value: decision.claim.trim(),
+    status: decision.status,
+    confidence: decision.status === "USER_SAID" ? 0.92 : (decision.status === "ASSUMED" ? 0.62 : 0.35),
+    evidence_refs: decision.evidence_refs ?? [],
+    confirmed_by_turn_id: decision.confirmed_by_turn_id ?? null,
+    source: decision.status === "USER_SAID" ? "user" : "system",
+  }));
+
+  rows.push({
+    project_id: input.projectId,
+    cycle_no: input.cycleNo,
+    slot_key: "domain_kit",
+    slot_value: input.domainKitKey,
+    status: "ASSUMED",
+    confidence: 0.6,
+    evidence_refs: [`turn:${input.userTurnId}`],
+    confirmed_by_turn_id: null,
+    source: "domain_kit",
+  });
+
+  const { data: upsertedRows, error: upsertError } = await serviceClient
+    .from("kodos_v3_slots")
+    .upsert(rows, { onConflict: "project_id,cycle_no,slot_key" })
+    .select("id,slot_key,status,slot_value,evidence_refs,confirmed_by_turn_id");
+
+  if (upsertError) {
+    if (isMissingV3ObjectError(upsertError)) return;
+    console.log(`[next-turn] kodos_v3_slots_upsert_error=${String(upsertError.code ?? "")}:${String(upsertError.message ?? "unknown")}`);
+    return;
+  }
+
+  if (!Array.isArray(upsertedRows) || upsertedRows.length === 0) return;
+
+  const eventRows = upsertedRows.map((row) => {
+    const item = row as Record<string, unknown>;
+    const status = String(item.status ?? "UNKNOWN");
+    const eventType = status === "USER_SAID"
+      ? "confirmed"
+      : (status === "UNKNOWN" ? "deferred" : "updated");
+    return {
+      project_id: input.projectId,
+      cycle_no: input.cycleNo,
+      slot_id: String(item.id),
+      event_type: eventType,
+      previous_status: null,
+      new_status: status,
+      value_snapshot: String(item.slot_value ?? ""),
+      evidence_refs: Array.isArray(item.evidence_refs) ? item.evidence_refs as string[] : [],
+      actor_type: "SERVICE",
+      actor_turn_id: input.userTurnId,
+    };
+  });
+
+  const { error: eventError } = await serviceClient.from("kodos_v3_slot_events").insert(eventRows);
+  if (eventError && !isMissingV3ObjectError(eventError)) {
+    console.log(`[next-turn] kodos_v3_slot_events_insert_error=${String(eventError.code ?? "")}:${String(eventError.message ?? "unknown")}`);
+  }
+}
+
+async function persistV3MemoryFromTurn(
+  serviceClient: ReturnType<typeof createClient>,
+  input: {
+    openAIKey: string;
+    projectId: string;
+    cycleNo: number;
+    turnId: string;
+    sourceText: string;
+    selectedOptionId: string;
+    domainKitKey: string;
+  },
+) {
+  const sourceText = input.sourceText.trim();
+  if (!sourceText) return;
+
+  const sourceHash = await sha256String(sourceText);
+  const embedding = input.openAIKey && sourceText.length >= 12
+    ? await generateEmbedding(input.openAIKey, sourceText)
+    : null;
+
+  const memoryRows: Array<Record<string, unknown>> = [
+    {
+      project_id: input.projectId,
+      cycle_no: input.cycleNo,
+      source_type: "intake_turn",
+      source_id: input.turnId,
+      chunk_text: sourceText,
+      trust_label: "USER_SAID",
+      embedding,
+      embedding_model: "text-embedding-3-small",
+      provenance_refs: [`turn:${input.turnId}`],
+      metadata: {
+        selected_option_id: input.selectedOptionId || null,
+        domain_kit_key: input.domainKitKey,
+      },
+      source_hash: sourceHash,
+    },
+    {
+      project_id: input.projectId,
+      cycle_no: input.cycleNo,
+      source_type: "domain_kit",
+      source_id: input.domainKitKey,
+      chunk_text: `domain_kit:${input.domainKitKey}`,
+      trust_label: "ASSUMED",
+      embedding: null,
+      embedding_model: "text-embedding-3-small",
+      provenance_refs: [`turn:${input.turnId}`],
+      metadata: {
+        domain_kit_key: input.domainKitKey,
+      },
+      source_hash: await sha256String(`domain_kit:${input.domainKitKey}`),
+    },
+  ];
+
+  const { error } = await serviceClient
+    .from("kodos_v3_memory_chunks")
+    .upsert(memoryRows, {
+      onConflict: "project_id,cycle_no,source_type,source_id,embedding_model,source_hash",
+    });
+  if (error && !isMissingV3ObjectError(error)) {
+    console.log(`[next-turn] kodos_v3_memory_chunks_upsert_error=${String(error.code ?? "")}:${String(error.message ?? "unknown")}`);
+  }
+}
+
+function buildDocStrengths(input: {
+  decisions: DecisionItem[];
+  unresolvedCount: number;
+  qualityReady: boolean;
+  signalState: SignalState;
+  artifactContext: ArtifactContext;
+  hasDraftPlan: boolean;
+}): DocStrength[] {
+  const decisionWeightByRole: Record<string, number[]> = {
+    business_type: [1, 2, 3],
+    primary_outcome: [2, 4, 7],
+    launch_capabilities: [4, 5, 9, 10],
+    monetization_path: [5, 9],
+    primary_audience: [2, 7],
+    quality_signal: [7, 9, 10],
+    refinement_focus: [8, 9],
+    latest_user_intent: [1, 2],
+  };
+
+  const roleScore: Record<number, number> = {};
+  const roleReasons: Record<number, string[]> = {};
+  for (let roleId = 1; roleId <= 10; roleId += 1) {
+    roleScore[roleId] = 38;
+    roleReasons[roleId] = [];
+  }
+
+  for (const decision of input.decisions) {
+    const roles = decisionWeightByRole[decision.decision_key] ?? [];
+    if (roles.length === 0) continue;
+
+    const statusBoost = decision.status === "USER_SAID" ? 10 : (decision.status === "ASSUMED" ? 5 : 1);
+    const lockBoost = decision.lock_state === "locked" ? 3 : 0;
+    const evidenceBoost = Array.isArray(decision.evidence_refs) && decision.evidence_refs.length > 0 ? 2 : 0;
+    const delta = statusBoost + lockBoost + evidenceBoost;
+
+    for (const roleId of roles) {
+      roleScore[roleId] += delta;
+      if (decision.status === "USER_SAID" && decision.lock_state === "locked") {
+        roleReasons[roleId].push(`Confirmed ${decision.decision_key.replace(/_/g, " ")}.`);
+      } else if (decision.status === "ASSUMED") {
+        roleReasons[roleId].push(`Assumption in ${decision.decision_key.replace(/_/g, " ")} needs confirmation.`);
+      } else {
+        roleReasons[roleId].push(`Unknown remains in ${decision.decision_key.replace(/_/g, " ")}.`);
+      }
+    }
+  }
+
+  const artifactVerified = input.artifactContext.row
+    ? input.artifactContext.row.verification_state !== "unverified"
+    : false;
+  if (artifactVerified) {
+    for (let roleId = 1; roleId <= 10; roleId += 1) {
+      roleScore[roleId] += 4;
+    }
+  }
+
+  if (input.qualityReady) {
+    for (let roleId = 1; roleId <= 10; roleId += 1) {
+      roleScore[roleId] += 5;
+    }
+  }
+
+  if (input.hasDraftPlan) {
+    for (let roleId = 1; roleId <= 10; roleId += 1) {
+      roleScore[roleId] += 3;
+      roleReasons[roleId].push("Draft already exists; this role can be strengthened incrementally.");
+    }
+  }
+
+  const unresolvedPenalty = Math.min(20, input.unresolvedCount * 2);
+  const provenanceDensity = Math.max(0, Math.min(1, (input.signalState.richEvidenceCount + (artifactVerified ? 1 : 0)) / 6));
+
+  const strengths: DocStrength[] = [];
+  for (let roleId = 1; roleId <= 10; roleId += 1) {
+    const raw = roleScore[roleId] - unresolvedPenalty + (provenanceDensity * 8);
+    const score = Math.max(20, Math.min(98, Math.round(raw)));
+    const qualityTier: "mvp" | "solid" | "strong" = score < 55 ? "mvp" : (score < 78 ? "solid" : "strong");
+    const reasons = roleReasons[roleId].slice(0, 3);
+    if (reasons.length === 0) {
+      reasons.push("More direct input will strengthen this role.");
+    }
+    strengths.push({
+      role_id: roleId,
+      score,
+      quality_tier: qualityTier,
+      unresolved_count: input.unresolvedCount,
+      provenance_density: Number(provenanceDensity.toFixed(3)),
+      reasons,
+    });
+  }
+
+  return strengths;
+}
+
+function derivePlanStage(input: {
+  hasDraftPlan: boolean;
+  canCommit: boolean;
+  unresolvedCount: number;
+  qualityBoostAvailable: boolean;
+}): PlanStage {
+  if (!input.hasDraftPlan && input.canCommit) return "draft_ready";
+  if (!input.hasDraftPlan) return "idea_capture";
+  if (input.hasDraftPlan && (input.qualityBoostAvailable || input.unresolvedCount > 0)) return "draft_strengthening";
+  return "builder_ready";
+}
+
+async function persistV3DocStrengthSnapshots(
+  serviceClient: ReturnType<typeof createClient>,
+  input: {
+    projectId: string;
+    cycleNo: number;
+    contractVersionId: string | null;
+    docStrengths: DocStrength[];
+    generatedBy: "next-turn" | "commit-contract" | "manual";
+  },
+) {
+  const rows = input.docStrengths.map((strength) => ({
+    project_id: input.projectId,
+    cycle_no: input.cycleNo,
+    contract_version_id: input.contractVersionId,
+    role_id: strength.role_id,
+    strength_score: strength.score,
+    quality_tier: strength.quality_tier,
+    unresolved_count: strength.unresolved_count,
+    provenance_density: strength.provenance_density,
+    notes: strength.reasons,
+    generated_by: input.generatedBy,
+  }));
+
+  const { error } = await serviceClient.from("kodos_v3_doc_strength_snapshots").insert(rows);
+  if (error && !isMissingV3ObjectError(error)) {
+    console.log(`[next-turn] kodos_v3_doc_strength_snapshots_insert_error=${String(error.code ?? "")}:${String(error.message ?? "unknown")}`);
+  }
+}
+
+async function persistV3RetrievalRun(
+  serviceClient: ReturnType<typeof createClient>,
+  input: {
+    projectId: string;
+    cycleNo: number;
+    purpose: "question_planning" | "doc_generation" | "doc_strength";
+    queryText: string;
+    topK: number;
+    results: Record<string, unknown>;
+  },
+) {
+  const started = Date.now();
+  const { error } = await serviceClient.from("kodos_v3_retrieval_runs").insert({
+    project_id: input.projectId,
+    cycle_no: input.cycleNo,
+    purpose: input.purpose,
+    query_text: input.queryText,
+    top_k: input.topK,
+    results: input.results,
+    latency_ms: Date.now() - started,
+  });
+  if (error && !isMissingV3ObjectError(error)) {
+    console.log(`[next-turn] kodos_v3_retrieval_runs_insert_error=${String(error.code ?? "")}:${String(error.message ?? "unknown")}`);
+  }
+}
+
+async function persistV5QuestionTrace(
+  serviceClient: ReturnType<typeof createClient>,
+  input: {
+    projectId: string;
+    cycleNo: number;
+    turnId: string;
+    slotKey: string;
+    questionText: string;
+    options: Suggestion[];
+    whyQuestion: string;
+    understanding: UnderstandingIndicator;
+    retrievalRefs: string[];
+  },
+) {
+  const { error } = await serviceClient.from("kodos_v5_question_traces").insert({
+    project_id: input.projectId,
+    cycle_no: input.cycleNo,
+    turn_id: input.turnId,
+    slot_key: input.slotKey,
+    question_text: input.questionText,
+    options: input.options,
+    why_question: input.whyQuestion,
+    understanding_level: input.understanding.level,
+    understanding_summary: input.understanding.summary,
+    retrieval_refs: input.retrievalRefs,
+    retrieval_count: input.retrievalRefs.length,
+  });
+  if (error && !isMissingV3ObjectError(error)) {
+    console.log(`[next-turn] kodos_v5_question_traces_insert_error=${String(error.code ?? "")}:${String(error.message ?? "unknown")}`);
+  }
+}
+
+function isMissingV3ObjectError(error: { code?: string; message?: string } | null): boolean {
+  const code = String(error?.code ?? "");
+  return code === "42P01" || code === "42703" || code === "42704";
+}
 
 async function processArtifactContext(
   serviceClient: ReturnType<typeof createClient>,
@@ -1791,141 +2347,251 @@ async function upsertMeaningMarkers(
   }, { onConflict: "project_id,cycle_no,decision_key" });
 }
 
+type SlotDefinition = {
+  key: string;
+  decision_key: string;
+  base_priority: number;
+  prompt: string;
+  suggestions: Suggestion[];
+};
+
+const SLOT_DEFINITIONS: SlotDefinition[] = [
+  {
+    key: "business_type",
+    decision_key: "business_type",
+    base_priority: 100,
+    prompt: "What kind of app are you building first?",
+    suggestions: [
+      { id: "business_type:service", label: "Service bookings" },
+      { id: "business_type:selling", label: "Selling products" },
+      { id: "business_type:content", label: "Content or community" },
+      { id: "business_type:internal_tool", label: "Internal business tool" },
+      { id: "none_fit", label: "None fit, I’ll describe it" },
+    ],
+  },
+  {
+    key: "primary_outcome",
+    decision_key: "primary_outcome",
+    base_priority: 95,
+    prompt: "What should people do first in your app?",
+    suggestions: [
+      { id: "outcome:book", label: "Book something" },
+      { id: "outcome:buy", label: "Buy and pay" },
+      { id: "outcome:browse", label: "Browse options" },
+      { id: "outcome:request", label: "Send a request" },
+      { id: "none_fit", label: "None fit, I’ll describe it" },
+    ],
+  },
+  {
+    key: "launch_capabilities",
+    decision_key: "launch_capabilities",
+    base_priority: 92,
+    prompt: "Pick one or two must-have features for version one.",
+    suggestions: [
+      { id: "capability:online_scheduling", label: "Booking and calendar" },
+      { id: "capability:payment_processing", label: "Checkout and payments" },
+      { id: "capability:catalog_search", label: "Catalog and search" },
+      { id: "capability:client_reminders", label: "Notifications and reminders" },
+      { id: "none_fit", label: "None fit, I’ll describe it" },
+    ],
+  },
+  {
+    key: "monetization_path",
+    decision_key: "monetization_path",
+    base_priority: 90,
+    prompt: "How should version one handle payments?",
+    suggestions: [
+      { id: "monetization:required", label: "Take payments in app now" },
+      { id: "monetization:later", label: "Collect requests first, pay later" },
+      { id: "monetization:none", label: "No payments in version one" },
+      { id: "none_fit", label: "None fit, I’ll describe it" },
+    ],
+  },
+  {
+    key: "primary_audience",
+    decision_key: "primary_audience",
+    base_priority: 56,
+    prompt: "Who is the main user you are designing for?",
+    suggestions: [
+      { id: "audience:consumer", label: "Individual customers" },
+      { id: "audience:business", label: "Businesses or teams" },
+      { id: "audience:creator", label: "Creators or sellers" },
+      { id: "none_fit", label: "None fit, I’ll describe it" },
+    ],
+  },
+  {
+    key: "trust_focus",
+    decision_key: "quality_signal",
+    base_priority: 54,
+    prompt: "What must feel trustworthy on day one?",
+    suggestions: [
+      { id: "trust:checkout", label: "Secure checkout" },
+      { id: "trust:identity", label: "Verified users and profiles" },
+      { id: "trust:support", label: "Clear support and policies" },
+      { id: "none_fit", label: "None fit, I’ll describe it" },
+    ],
+  },
+  {
+    key: "operations_focus",
+    decision_key: "quality_signal",
+    base_priority: 53,
+    prompt: "What do you need to manage every day in the app?",
+    suggestions: [
+      { id: "ops:orders", label: "Orders or requests" },
+      { id: "ops:schedule", label: "Schedule and availability" },
+      { id: "ops:content", label: "Catalog or content updates" },
+      { id: "none_fit", label: "None fit, I’ll describe it" },
+    ],
+  },
+  {
+    key: "brand_feel",
+    decision_key: "quality_signal",
+    base_priority: 52,
+    prompt: "How should this app feel to your users?",
+    suggestions: [
+      { id: "brand:premium", label: "Premium and polished" },
+      { id: "brand:fast", label: "Fast and simple" },
+      { id: "brand:friendly", label: "Warm and welcoming" },
+      { id: "none_fit", label: "None fit, I’ll describe it" },
+    ],
+  },
+];
+
 async function buildNextQuestionPlan(input: {
+  serviceClient: ReturnType<typeof createClient>;
+  openAIKey: string;
+  projectId: string;
+  cycleNo: number;
   recentTurns: IntakeTurn[];
   decisions: DecisionItem[];
   latestUserText: string;
   selectedOptionId: string;
 }): Promise<NextQuestionPlan> {
-  const plan = deterministicQuestionPlan(input.latestUserText, input.selectedOptionId, input.decisions);
-  return plan;
-}
+  const byKey = latestDecisionByKey(input.decisions);
+  const retrieval = await retrieveMemoryMatchesForQuestion(input);
 
-function buildArtifactVerificationPlan(artifact: ArtifactInputRow, statusMessage: string | null, hasStoredRefs: boolean): NextQuestionPlan {
-  const prefix = statusMessage ? `${statusMessage} ` : "";
-  const summary = artifact.summary_text && artifact.summary_text.trim().length > 0
-    ? artifact.summary_text.trim()
-    : "I do not yet have enough extracted site content to summarize reliably.";
-  const provenanceNote = hasStoredRefs
-    ? "(based on stored extracted website content)"
-    : "(I still need usable extracted website content)";
+  const slot = chooseNextSlot({
+    byKey,
+    selectedOptionId: input.selectedOptionId,
+    latestUserText: input.latestUserText,
+  });
+
+  const anchor = bestAnchorFromRetrieval(retrieval);
+  const assistantMessage = buildPlainQuestion(slot.prompt, anchor);
+  const anchorRefs = retrieval
+    .flatMap((item) => item.provenance_refs ?? [])
+    .filter((value, idx, arr) => arr.indexOf(value) === idx)
+    .slice(0, 6);
 
   return {
-    assistant_message: `${prefix}${provenanceNote} Did I understand your site correctly: ${summary}`,
-    suggestions: [
-      { id: "artifact_verify:right", label: "Yes, that is right" },
-      { id: "artifact_verify:mostly", label: "Mostly right, needs correction" },
-      { id: "artifact_verify:wrong", label: "No, that is not right" },
-      { id: "artifact_verify:proceed_uncertain", label: "Proceed with uncertainty" },
-    ],
-    why_question: "Artifact context is present; comprehension verification must happen before feature narrowing.",
+    assistant_message: assistantMessage,
+    suggestions: slot.suggestions,
+    why_question: `slot:${slot.key}`,
+    slot_key: slot.key,
+    anchor_refs: anchorRefs,
   };
 }
 
-function deterministicQuestionPlan(latestUserText: string, selectedOptionId: string, decisions: DecisionItem[]): NextQuestionPlan {
-  const lower = latestUserText.trim().toLowerCase();
-  const byKey = latestDecisionByKey(decisions);
+function chooseNextSlot(input: {
+  byKey: Record<string, DecisionItem>;
+  selectedOptionId: string;
+  latestUserText: string;
+}): SlotDefinition {
+  const coreSlots = SLOT_DEFINITIONS.filter((slot) =>
+    slot.key === "business_type" ||
+    slot.key === "primary_outcome" ||
+    slot.key === "launch_capabilities" ||
+    slot.key === "monetization_path"
+  );
 
-  if (!isDecisionConfirmed(byKey["business_type"])) {
-    return {
-      assistant_message: "What kind of app are you building first?",
-      suggestions: [
-        { id: "business_type:service", label: "Service bookings" },
-        { id: "business_type:selling", label: "Selling products or packages" },
-        { id: "business_type:content", label: "Content or community" },
-        { id: "business_type:internal_tool", label: "Internal business tool" },
-        { id: "none_fit", label: "None fit, I’ll describe it" },
-      ],
-      why_question: "business_type_missing",
-    };
+  for (const slot of coreSlots) {
+    if (!isDecisionConfirmed(input.byKey[slot.decision_key])) {
+      return slot;
+    }
   }
 
-  if (!isDecisionConfirmed(byKey["primary_outcome"])) {
-    return {
-      assistant_message: "What should customers do first in your app?",
-      suggestions: [
-        { id: "outcome:book", label: "Book a service" },
-        { id: "outcome:buy", label: "Buy and pay" },
-        { id: "outcome:browse", label: "Browse content or offers" },
-        { id: "outcome:request", label: "Send a request" },
-        { id: "none_fit", label: "None fit, I’ll describe it" },
-      ],
-      why_question: "primary_outcome_missing",
-    };
+  if (input.selectedOptionId === "readiness:improve_quality") {
+    return SLOT_DEFINITIONS.find((slot) => slot.key === "trust_focus") ?? SLOT_DEFINITIONS[0];
   }
 
-  if (!isDecisionConfirmed(byKey["launch_capabilities"])) {
-    return {
-      assistant_message: "Choose one or two capabilities for version one.",
-      suggestions: [
-        { id: "capability:online_scheduling", label: "Booking and calendar" },
-        { id: "capability:payment_processing", label: "Online payments" },
-        { id: "capability:client_reminders", label: "Client reminders" },
-        { id: "capability:simple_gallery", label: "Portfolio or gallery" },
-        { id: "none_fit", label: "None fit, I’ll describe it" },
-      ],
-      why_question: "launch_capabilities_missing",
-    };
+  const lowText = input.latestUserText.trim().toLowerCase();
+  if (lowText.includes("brand") || lowText.includes("look") || lowText.includes("feel")) {
+    return SLOT_DEFINITIONS.find((slot) => slot.key === "brand_feel") ?? SLOT_DEFINITIONS[0];
+  }
+  if (lowText.includes("trust") || lowText.includes("safe") || lowText.includes("secure")) {
+    return SLOT_DEFINITIONS.find((slot) => slot.key === "trust_focus") ?? SLOT_DEFINITIONS[0];
+  }
+  if (lowText.includes("manage") || lowText.includes("admin") || lowText.includes("dashboard")) {
+    return SLOT_DEFINITIONS.find((slot) => slot.key === "operations_focus") ?? SLOT_DEFINITIONS[0];
+  }
+  return SLOT_DEFINITIONS.find((slot) => slot.key === "primary_audience") ?? SLOT_DEFINITIONS[0];
+}
+
+async function retrieveMemoryMatchesForQuestion(input: {
+  serviceClient: ReturnType<typeof createClient>;
+  openAIKey: string;
+  projectId: string;
+  cycleNo: number;
+  latestUserText: string;
+  selectedOptionId: string;
+}): Promise<MemoryMatch[]> {
+  const queryText = `${input.latestUserText} ${input.selectedOptionId}`.trim();
+  const queryEmbedding = input.openAIKey && queryText.length >= 12
+    ? await generateEmbedding(input.openAIKey, queryText)
+    : null;
+
+  if (queryEmbedding && queryEmbedding.length > 0) {
+    const { data, error } = await input.serviceClient.rpc("kodos_v5_match_memory_chunks", {
+      p_project_id: input.projectId,
+      p_cycle_no: input.cycleNo,
+      p_query_embedding: queryEmbedding,
+      p_match_count: 8,
+    });
+    if (!error && Array.isArray(data)) {
+      return data.map((row) => toMemoryMatch(row as Record<string, unknown>));
+    }
   }
 
-  if (!isDecisionConfirmed(byKey["monetization_path"])) {
-    return {
-      assistant_message: "How should version one handle payments?",
-      suggestions: [
-        { id: "monetization:required", label: "Take payments in app now" },
-        { id: "monetization:later", label: "Collect requests first, payments later" },
-        { id: "monetization:none", label: "No payments needed in version one" },
-        { id: "none_fit", label: "None fit, I’ll describe it" },
-      ],
-      why_question: "monetization_missing",
-    };
-  }
+  const { data, error } = await input.serviceClient
+    .from("kodos_v3_memory_chunks")
+    .select("source_type,source_id,chunk_text,trust_label,provenance_refs,metadata")
+    .eq("project_id", input.projectId)
+    .eq("cycle_no", input.cycleNo)
+    .order("created_at", { ascending: false })
+    .limit(8);
+  if (error || !Array.isArray(data)) return [];
+  return data.map((row) => toMemoryMatch(row as Record<string, unknown>));
+}
 
-  if (selectedOptionId === "readiness:improve_quality") {
-    return {
-      assistant_message: "Great. One quick thing: what should feel uniquely yours in this first version?",
-      suggestions: [
-        { id: "quality:brand_feel", label: "Brand look and tone" },
-        { id: "quality:customer_journey", label: "Customer flow and trust" },
-        { id: "quality:operations", label: "How you run it day to day" },
-        { id: "none_fit", label: "None fit, I’ll describe it" },
-      ],
-      why_question: "quality_boost_refinement",
-    };
-  }
-
-  if (hasUserSignaledScopeComplete(lower)) {
-    return {
-      assistant_message: "Perfect. We have enough to prepare your draft packet. Want to review blockers or commit now?",
-      suggestions: [
-        { id: "readiness:review_blockers", label: "Review blockers first" },
-        { id: "readiness:ready_to_commit", label: "Ready to commit draft" },
-      ],
-      why_question: "user_signaled_scope_complete",
-    };
-  }
-
-  if (selectedOptionId.startsWith("capability:") || selectedOptionId.startsWith("monetization:")) {
-    return {
-      assistant_message: "Great. Do you want to lock this first version now or answer one more setup question?",
-      suggestions: [
-        { id: "readiness:ready_to_commit", label: "Lock this first version now" },
-        { id: "refine:customer_flow", label: "One more question about customer flow" },
-      ],
-      why_question: "post_capability_nuance_probe",
-    };
-  }
-
+function toMemoryMatch(row: Record<string, unknown>): MemoryMatch {
+  const rawTrust = String(row.trust_label ?? "ASSUMED");
   return {
-    assistant_message: "Pick the next detail to lock for your first version.",
-    suggestions: [
-      { id: "refine:pricing_rules", label: "Pricing and payment rules" },
-      { id: "refine:booking_rules", label: "Booking and scheduling rules" },
-      { id: "refine:user_roles", label: "User roles and permissions" },
-      { id: "none_fit", label: "None fit, I’ll describe it" },
-    ],
-    why_question: "default_blocker_reduction",
+    source_type: String(row.source_type ?? "intake_turn"),
+    source_id: String(row.source_id ?? ""),
+    chunk_text: String(row.chunk_text ?? ""),
+    trust_label: isTrustLabel(rawTrust) ? rawTrust : "ASSUMED",
+    provenance_refs: Array.isArray(row.provenance_refs) ? row.provenance_refs.map((item) => String(item)) : [],
+    metadata: typeof row.metadata === "object" && row.metadata !== null ? row.metadata as Record<string, unknown> : {},
+    similarity: Number(row.similarity ?? 0),
   };
+}
+
+function bestAnchorFromRetrieval(matches: MemoryMatch[]): string | null {
+  const ranked = [...matches]
+    .filter((item) => item.chunk_text.trim().length >= 20)
+    .sort((a, b) => b.similarity - a.similarity);
+  const candidate = ranked[0]?.chunk_text ?? "";
+  const clean = candidate
+    .replace(/\s+/g, " ")
+    .replace(/https?:\/\/\S+/g, "")
+    .trim();
+  if (!clean) return null;
+  return clean.length > 86 ? `${clean.slice(0, 83)}...` : clean;
+}
+
+function buildPlainQuestion(basePrompt: string, anchor: string | null): string {
+  if (!anchor) return basePrompt;
+  return `${basePrompt} You mentioned "${anchor}".`;
 }
 
 function sanitizeQuestionPlan(plan: NextQuestionPlan): NextQuestionPlan {
@@ -1954,6 +2620,68 @@ function sanitizeQuestionPlan(plan: NextQuestionPlan): NextQuestionPlan {
     assistant_message: assistantMessage,
     suggestions,
     why_question: plan.why_question,
+    slot_key: plan.slot_key,
+    anchor_refs: plan.anchor_refs,
+  };
+}
+
+function enforceQuestionPlanInvariants(plan: NextQuestionPlan): NextQuestionPlan {
+  const allowedPrefixesBySlot: Record<string, string[]> = {
+    business_type: ["business_type", "none_fit"],
+    primary_outcome: ["outcome", "none_fit"],
+    launch_capabilities: ["capability", "none_fit"],
+    monetization_path: ["monetization", "none_fit"],
+    primary_audience: ["audience", "none_fit"],
+    trust_focus: ["trust", "none_fit"],
+    operations_focus: ["ops", "none_fit"],
+    brand_feel: ["brand", "none_fit"],
+    quality_signal: ["trust", "ops", "brand", "audience", "none_fit"],
+    commit_decision: ["readiness"],
+    artifact_verification: ["checkpoint", "artifact_verify"],
+  };
+
+  const allowed = allowedPrefixesBySlot[plan.slot_key];
+  if (!allowed) {
+    return fallbackQuestionPlan("business_type");
+  }
+
+  if (plan.suggestions.length === 0) {
+    return plan;
+  }
+
+  const allValid = plan.suggestions.every((option) => {
+    const id = option.id.trim();
+    if (!id) return false;
+    const prefix = id.includes(":") ? id.split(":", 1)[0] : id;
+    return allowed.includes(prefix);
+  });
+
+  if (allValid) return plan;
+  return fallbackQuestionPlan(plan.slot_key);
+}
+
+function fallbackQuestionPlan(slotKey: string): NextQuestionPlan {
+  const slot = SLOT_DEFINITIONS.find((candidate) => candidate.key === slotKey)
+    ?? SLOT_DEFINITIONS.find((candidate) => candidate.key === "business_type")
+    ?? {
+      key: "business_type",
+      decision_key: "business_type",
+      base_priority: 100,
+      prompt: "What kind of app are you building first?",
+      suggestions: [
+        { id: "business_type:service", label: "Service bookings" },
+        { id: "business_type:selling", label: "Selling products" },
+        { id: "business_type:content", label: "Content or community" },
+        { id: "none_fit", label: "None fit, I’ll describe it" },
+      ],
+    };
+
+  return {
+    assistant_message: slot.prompt,
+    suggestions: slot.suggestions,
+    why_question: `fallback:${slot.key}`,
+    slot_key: slot.key,
+    anchor_refs: [],
   };
 }
 
@@ -2144,6 +2872,12 @@ function normalizeStructuredSelection(selectedOptionId: string, noneFitText: str
       return { decisionKey: "refinement_focus", claim: `Refinement focus: ${value}.` };
     case "quality":
       return { decisionKey: "quality_signal", claim: `Quality focus confirmed: ${value}.` };
+    case "trust":
+      return { decisionKey: "quality_signal", claim: `Trust priority for version one: ${value}.` };
+    case "ops":
+      return { decisionKey: "quality_signal", claim: `Operational priority for version one: ${value}.` };
+    case "brand":
+      return { decisionKey: "quality_signal", claim: `Brand feeling target: ${value}.` };
     default:
       return null;
   }
@@ -2188,6 +2922,51 @@ function buildReadinessState(input: {
     total_count: total,
     next_focus: nextFocus,
     buckets,
+  };
+}
+
+function buildUnderstandingIndicator(input: {
+  readiness: ReadinessState;
+  planStage: PlanStage;
+  docStrengths: DocStrength[];
+  canCommit: boolean;
+  qualityBoostAvailable: boolean;
+}): UnderstandingIndicator {
+  const avgStrength = input.docStrengths.length > 0
+    ? Math.round(input.docStrengths.reduce((sum, item) => sum + item.score, 0) / input.docStrengths.length)
+    : input.readiness.score;
+
+  const confidence = Math.max(0.1, Math.min(0.99, avgStrength / 100));
+  if (input.planStage === "builder_ready") {
+    return {
+      level: "strong_builder_ready",
+      title: "Strong builder-ready understanding",
+      summary: "Your plan is clear enough to hand to builders for a first implementation demo.",
+      next_step: "Review your 10-document plan and submit when ready.",
+      confidence,
+    };
+  }
+
+  if (input.canCommit) {
+    return {
+      level: "good_draft_ready",
+      title: "Good draft-ready understanding",
+      summary: input.qualityBoostAvailable
+        ? "Your core plan is locked. One more detail can make the draft stronger."
+        : "Your core plan is locked and ready for draft generation.",
+      next_step: input.qualityBoostAvailable
+        ? "Generate now, or answer one targeted question to strengthen the draft."
+        : "Generate your draft plan now.",
+      confidence,
+    };
+  }
+
+  return {
+    level: "needs_basics",
+    title: "Needs a few basics",
+    summary: `We still need ${Math.max(1, input.readiness.total_count - input.readiness.resolved_count)} setup details before draft generation.`,
+    next_step: `Next best step: ${input.readiness.next_focus}.`,
+    confidence,
   };
 }
 
@@ -2240,17 +3019,19 @@ function hasQualityReadiness(coreReady: boolean, signalState: SignalState, rows:
   return false;
 }
 
-function buildQualityQuestionPlan(signalState: SignalState): NextQuestionPlan {
+function buildQualityQuestionPlan(_signalState: SignalState): NextQuestionPlan {
   return {
-    assistant_message: "Choose one final setup area to lock before generating your first draft plan.",
+    assistant_message: "Choose one more quick detail before generating your draft plan.",
     suggestions: [
-      { id: "quality:customer_flow", label: "How customers should move through your app" },
-      { id: "quality:operations", label: "What you need to manage day to day" },
-      { id: "quality:trust", label: "What must feel trustworthy to users" },
-      { id: "quality:brand_feel", label: "How the app should feel and sound" },
+      { id: "trust:checkout", label: "What must feel trustworthy" },
+      { id: "ops:orders", label: "What you manage day to day" },
+      { id: "brand:premium", label: "How the app should feel" },
+      { id: "audience:consumer", label: "Who this first version is for" },
       { id: "none_fit", label: "None fit, I’ll describe it" },
     ],
     why_question: "quality_signal_gap",
+    slot_key: "quality_signal",
+    anchor_refs: [],
   };
 }
 
@@ -2504,6 +3285,8 @@ function buildPendingCheckpointPlan(checkpoint: NextTurnCheckpoint): NextQuestio
     assistant_message: "Please confirm the website context card to continue.",
     suggestions: [],
     why_question: `checkpoint_pending:${checkpoint.type}`,
+    slot_key: "artifact_verification",
+    anchor_refs: [],
   };
 }
 

@@ -15,9 +15,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "A10000000000000000000040"
-               BuildableName = "ShipFirstIntake.app"
-               BlueprintName = "ShipFirstIntake"
-               ReferencedContainer = "container:ShipFirstIntakeApp.xcodeproj">
+               BuildableName = "ShipFirstKodosIntake.app"
+               BlueprintName = "ShipFirstKodosIntake"
+               ReferencedContainer = "container:ShipFirstKodosIntakeApp.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
          <BuildActionEntry
@@ -29,9 +29,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "A10000000000000000000041"
-               BuildableName = "ShipFirstIntakeTests.xctest"
-               BlueprintName = "ShipFirstIntakeTests"
-               ReferencedContainer = "container:ShipFirstIntakeApp.xcodeproj">
+               BuildableName = "ShipFirstKodosIntakeTests.xctest"
+               BlueprintName = "ShipFirstKodosIntakeTests"
+               ReferencedContainer = "container:ShipFirstKodosIntakeApp.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -47,9 +47,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "A10000000000000000000041"
-               BuildableName = "ShipFirstIntakeTests.xctest"
-               BlueprintName = "ShipFirstIntakeTests"
-               ReferencedContainer = "container:ShipFirstIntakeApp.xcodeproj">
+               BuildableName = "ShipFirstKodosIntakeTests.xctest"
+               BlueprintName = "ShipFirstKodosIntakeTests"
+               ReferencedContainer = "container:ShipFirstKodosIntakeApp.xcodeproj">
             </BuildableReference>
          </TestableReference>
       </Testables>
@@ -69,9 +69,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A10000000000000000000040"
-            BuildableName = "ShipFirstIntake.app"
-            BlueprintName = "ShipFirstIntake"
-            ReferencedContainer = "container:ShipFirstIntakeApp.xcodeproj">
+            BuildableName = "ShipFirstKodosIntake.app"
+            BlueprintName = "ShipFirstKodosIntake"
+            ReferencedContainer = "container:ShipFirstKodosIntakeApp.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -86,9 +86,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A10000000000000000000040"
-            BuildableName = "ShipFirstIntake.app"
-            BlueprintName = "ShipFirstIntake"
-            ReferencedContainer = "container:ShipFirstIntakeApp.xcodeproj">
+            BuildableName = "ShipFirstKodosIntake.app"
+            BlueprintName = "ShipFirstKodosIntake"
+            ReferencedContainer = "container:ShipFirstKodosIntakeApp.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>

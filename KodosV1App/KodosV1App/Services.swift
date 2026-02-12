@@ -222,39 +222,19 @@ private enum APIDiagnostics {
 
 private enum SessionStore {
     static let key = "shipfirst.auth.session"
-    static let scopeKey = "shipfirst.auth.session.scope"
 
-    static func load(for config: RuntimeConfig) -> AuthSession? {
-        let expectedScope = scopeSignature(for: config)
-        let currentScope = UserDefaults.standard.string(forKey: scopeKey)
-        if currentScope != expectedScope {
-            clear()
-            UserDefaults.standard.set(expectedScope, forKey: scopeKey)
-            return nil
-        }
+    static func load() -> AuthSession? {
         guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
         return try? JSONDecoder().decode(AuthSession.self, from: data)
     }
 
-    static func save(_ session: AuthSession?, for config: RuntimeConfig) {
-        UserDefaults.standard.set(scopeSignature(for: config), forKey: scopeKey)
+    static func save(_ session: AuthSession?) {
         if let session {
             let data = try? JSONEncoder().encode(session)
             UserDefaults.standard.set(data, forKey: key)
         } else {
             UserDefaults.standard.removeObject(forKey: key)
         }
-    }
-
-    private static func clear() {
-        UserDefaults.standard.removeObject(forKey: key)
-        UserDefaults.standard.removeObject(forKey: scopeKey)
-    }
-
-    private static func scopeSignature(for config: RuntimeConfig) -> String {
-        let host = config.supabaseURL.host ?? config.supabaseURL.absoluteString
-        let keyPrefix = String(config.supabaseAnonKey.prefix(16))
-        return "\(host)|\(keyPrefix)"
     }
 }
 
@@ -326,15 +306,13 @@ final class AppState: ObservableObject {
 
     let draftStore = DraftStore()
     private let sessionReference = SessionReference()
-    private let runtimeConfig: RuntimeConfig?
     let api: SupabaseAPI?
 
     init() {
         do {
             let config = try RuntimeConfig.fromBundle()
-            self.runtimeConfig = config
             print("ShipFirst config loaded: url=\(config.supabaseURL.absoluteString), anon=\(RuntimeConfig.redacted(config.supabaseAnonKey))")
-            let loadedSession = SessionStore.load(for: config)
+            let loadedSession = SessionStore.load()
             if let loadedSession {
                 let claims = SessionInspector.jwtIssueAndExpiry(accessToken: loadedSession.accessToken)
                 APIDiagnostics.log("session.restore user=\(loadedSession.userID.uuidString) issued_at=\(claims.issuedAt ?? "unknown") expires_at=\(claims.expiresAt ?? "unknown") token=\(SessionInspector.redactedToken(loadedSession.accessToken))")
@@ -349,7 +327,7 @@ final class AppState: ObservableObject {
                 sessionProvider: { ref.value },
                 sessionWriter: { newSession in
                     ref.value = newSession
-                    SessionStore.save(newSession, for: config)
+                    SessionStore.save(newSession)
                 }
             )
             self.api = api
@@ -360,7 +338,6 @@ final class AppState: ObservableObject {
             }
             self.isReady = true
         } catch {
-            self.runtimeConfig = nil
             self.api = nil
             self.configError = error.localizedDescription
             self.isReady = false
@@ -370,9 +347,7 @@ final class AppState: ObservableObject {
     func saveSession(_ session: AuthSession?) {
         self.session = session
         self.sessionReference.value = session
-        if let runtimeConfig {
-            SessionStore.save(session, for: runtimeConfig)
-        }
+        SessionStore.save(session)
     }
 
     func signOut() {
@@ -400,16 +375,6 @@ private struct ProjectRow: Decodable {
         case activeCycleNo = "active_cycle_no"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
-    }
-}
-
-private struct ProjectCycleRow: Decodable {
-    let id: UUID?
-    let activeCycleNo: Int?
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case activeCycleNo = "active_cycle_no"
     }
 }
 
@@ -549,21 +514,14 @@ final class SupabaseAPI {
             )
             sessionWriter(refreshed)
             return refreshed
-        } catch let error as AppError {
-            switch error {
-            case .unauthorized, .forbidden:
-                sessionWriter(nil)
-                onSessionInvalid?()
-                throw AppError.unauthorized
-            default:
-                throw error
-            }
         } catch {
-            throw error
+            sessionWriter(nil)
+            onSessionInvalid?()
+            throw AppError.unauthorized
         }
     }
 
-    // MARK: Plans (mapped to project + cycle revision)
+    // MARK: Runs (mapped to project + cycle)
     func listRuns() async throws -> [RunSummary] {
         let projectURL = try postgrestURL(path: "projects", query: "select=id,owner_user_id,name,active_cycle_no,created_at,updated_at&order=created_at.desc")
         let projects: [ProjectRow] = try await request(
@@ -666,7 +624,7 @@ final class SupabaseAPI {
     func createRun() async throws -> RunSummary {
         let name = "Project \(ISO8601DateFormatter().string(from: Date()))"
         let payload: [String: Any] = ["name": name]
-        let url = try postgrestURL(path: "projects", query: "select=id,owner_user_id,name,active_cycle_no,created_at,updated_at")
+        let url = try postgrestURL(path: "projects", query: "select=id,owner_user_id,name,created_at,updated_at")
         let created: [ProjectRow] = try await request(
             url: url,
             method: "POST",
@@ -681,7 +639,7 @@ final class SupabaseAPI {
 
         return RunSummary(
             projectID: project.id,
-            cycleNo: max(project.activeCycleNo ?? 1, 1),
+            cycleNo: 1,
             title: project.name ?? "Untitled Project",
             status: "draft",
             latestContractVersionID: nil,
@@ -694,7 +652,6 @@ final class SupabaseAPI {
 
     func startNewCycle(projectID: UUID, from currentCycleNo: Int) async throws -> Int {
         let nextCycle = max(currentCycleNo, 1) + 1
-
         let updateURL = try postgrestURL(path: "projects", query: "id=eq.\(projectID.uuidString)")
         let payload: [String: Any] = ["active_cycle_no": nextCycle]
         let _: EmptyResponse = try await request(
@@ -777,7 +734,7 @@ final class SupabaseAPI {
     }
 
     func listDecisionItems(projectID: UUID, cycleNo: Int) async throws -> [DecisionItem] {
-        let query = "project_id=eq.\(projectID.uuidString)&cycle_no=eq.\(cycleNo)&select=id,project_id,cycle_no,decision_key,claim,status,evidence_refs,lock_state,confirmed_by_turn_id,has_conflict,conflict_key,updated_at&order=updated_at.desc"
+        let query = "project_id=eq.\(projectID.uuidString)&cycle_no=eq.\(cycleNo)&select=id,project_id,cycle_no,decision_key,claim,status,evidence_refs,lock_state,updated_at&order=updated_at.desc"
         let url = try postgrestURL(path: "decision_items", query: query)
         return try await request(url: url, method: "GET", bearerToken: requiredSession().accessToken)
     }
@@ -879,21 +836,18 @@ final class SupabaseAPI {
             artifactType: artifactType,
             forceRefresh: forceRefresh
         )
-        guard requestModel.hasActionableInput else {
-            throw AppError.validation("Select an option to continue.", ["Provide evidence, choose an option, respond to checkpoint, or provide a website URL."])
-        }
         return try await authorizedFunctionRequest(
             path: "next-turn",
-            bodyAny: try requestModel.toDictionary(),
+            bodyAny: requestModel.toDictionary(),
             operation: "functions.next_turn"
         )
     }
 
-    func commitContract(projectID: UUID, cycleNo: Int, generationMode: GenerationMode? = nil) async throws -> CommitContractResult {
-        let requestModel = CommitContractRequest(projectID: projectID, cycleNo: cycleNo, generationMode: generationMode)
+    func commitContract(projectID: UUID, cycleNo: Int) async throws -> CommitContractResult {
+        let requestModel = CommitContractRequest(projectID: projectID, cycleNo: cycleNo)
         return try await authorizedFunctionRequest(
             path: "commit-contract",
-            bodyAny: try requestModel.toDictionary(),
+            bodyAny: requestModel.toDictionary(),
             operation: "functions.commit_contract"
         )
     }
@@ -909,86 +863,6 @@ final class SupabaseAPI {
             bodyAny: payload,
             operation: "functions.submit_run"
         )
-    }
-
-    func performTypedAction(projectID: UUID, cycleNo: Int, action: TypedActionKind) async throws -> TypedActionOutcome {
-        switch action {
-        case .addEvidence(let text):
-            let result = try await nextTurn(
-                projectID: projectID,
-                cycleNo: cycleNo,
-                userMessage: text,
-                selectedOptionID: nil,
-                noneFitText: nil
-            )
-            return .turn(result)
-        case .selectOption(let id, let noneFitText):
-            let result = try await nextTurn(
-                projectID: projectID,
-                cycleNo: cycleNo,
-                userMessage: nil,
-                selectedOptionID: id,
-                noneFitText: noneFitText,
-                checkpointResponse: nil
-            )
-            return .turn(result)
-        case .respondCheckpoint(let id, let action, let optionalText):
-            let checkpointSelection = "checkpoint:\(action)"
-            let result = try await nextTurn(
-                projectID: projectID,
-                cycleNo: cycleNo,
-                userMessage: nil,
-                selectedOptionID: checkpointSelection,
-                noneFitText: nil,
-                checkpointResponse: NextTurnCheckpointResponse(
-                    checkpointID: id,
-                    action: action,
-                    optionalText: optionalText
-                )
-            )
-            return .turn(result)
-        case .correctArtifactUnderstanding(let checkpointID, let text):
-            if let checkpointID {
-                let result = try await nextTurn(
-                    projectID: projectID,
-                    cycleNo: cycleNo,
-                    userMessage: nil,
-                    selectedOptionID: "checkpoint:partial",
-                    noneFitText: nil,
-                    checkpointResponse: NextTurnCheckpointResponse(
-                        checkpointID: checkpointID,
-                        action: "partial",
-                        optionalText: text
-                    )
-                )
-                return .turn(result)
-            }
-            let result = try await nextTurn(
-                projectID: projectID,
-                cycleNo: cycleNo,
-                userMessage: text,
-                selectedOptionID: nil,
-                noneFitText: nil
-            )
-            return .turn(result)
-        case .deferUnknown(let pointer, let reason):
-            let trimmedReason = reason?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let message = "Defer unresolved item \(pointer)." + (trimmedReason.isEmpty ? "" : " \(trimmedReason)")
-            let result = try await nextTurn(
-                projectID: projectID,
-                cycleNo: cycleNo,
-                userMessage: message,
-                selectedOptionID: nil,
-                noneFitText: nil
-            )
-            return .turn(result)
-        case .requestCommit(let mode):
-            let result = try await commitContract(projectID: projectID, cycleNo: cycleNo, generationMode: mode)
-            return .commit(result)
-        case .confirmReviewAndSubmit:
-            let result = try await submitRun(projectID: projectID, cycleNo: cycleNo)
-            return .submit(result)
-        }
     }
 
     private func requiredSession() throws -> AuthSession {
@@ -1117,9 +991,7 @@ final class SupabaseAPI {
             APIDiagnostics.log("request.fail op=\(op) layer=\(layer.rawValue) status=\(http.statusCode) payload=\(payloadSummary)")
 
             if http.statusCode == 401 || http.statusCode == 403 {
-                // Only 401 means token/session auth failure. 403 is an authorization/policy denial
-                // and should not force refresh/sign-out.
-                if http.statusCode == 401 && requiresAuth && retryOnUnauthorized {
+                if requiresAuth && retryOnUnauthorized {
                     let refreshed = try await refreshSession()
                     return try await request(
                         url: url,
@@ -1151,9 +1023,6 @@ final class SupabaseAPI {
 
         APIDiagnostics.log("request.ok op=\(op) layer=\(layer.rawValue) status=\(http.statusCode)")
         do {
-            if T.self == EmptyResponse.self {
-                return EmptyResponse() as! T
-            }
             return try decoder.decode(T.self, from: data)
         } catch {
             APIDiagnostics.log("request.decode_fail op=\(op) layer=\(layer.rawValue) error=\(error.localizedDescription)")
@@ -1256,11 +1125,11 @@ private struct AnyDecodable: Decodable {
 private struct EmptyResponse: Decodable {}
 
 private extension Encodable {
-    func toDictionary() throws -> [String: Any] {
+    func toDictionary() -> [String: Any] {
         let encoder = JSONEncoder()
         guard let data = try? encoder.encode(self),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw AppError.malformedResponse("Failed to encode request payload.")
+            return [:]
         }
         return object
     }
